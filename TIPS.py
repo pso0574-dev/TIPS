@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timedelta
+from io import StringIO
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -37,7 +37,7 @@ st.set_page_config(
 
 st.title("📊 TIPS Buy/Sell Timing Dashboard")
 st.caption(
-    "Monitor real yield, breakeven inflation, CPI trend, and compare TIP / TLT / GLD / DBC / IEF"
+    "Monitor real yield, breakeven inflation, CPI trend, and compare TIP / VTIP / SCHP / TLT / GLD / DBC / IEF"
 )
 
 
@@ -49,16 +49,16 @@ st.sidebar.header("Settings")
 lookback_years = st.sidebar.slider("Price lookback (years)", 1, 15, 5, 1)
 fred_years = st.sidebar.slider("Macro lookback (years)", 3, 25, 10, 1)
 font_size = st.sidebar.slider("Base font size", 10, 24, 14, 1)
-price_ma_short = st.sidebar.slider("Short MA", 10, 100, 50, 5)
-price_ma_long = st.sidebar.slider("Long MA", 50, 300, 200, 10)
+price_ma_short = st.sidebar.slider("Short moving average", 10, 100, 50, 5)
+price_ma_long = st.sidebar.slider("Long moving average", 50, 300, 200, 10)
 
 selected_assets = st.sidebar.multiselect(
     "ETF universe",
     ["TIP", "VTIP", "SCHP", "TLT", "IEF", "GLD", "IAU", "DBC", "PDBC", "SPY", "QQQ"],
-    default=["TIP", "TLT", "GLD", "DBC", "IEF"],
+    default=["TIP", "VTIP", "TLT", "GLD", "DBC", "IEF"],
 )
 
-use_log_scale = st.sidebar.checkbox("Use log scale for price charts", value=False)
+use_log_scale = st.sidebar.checkbox("Use log scale on price charts", value=False)
 show_drawdown = st.sidebar.checkbox("Show drawdown chart", value=True)
 
 refresh = st.sidebar.button("🔄 Refresh data")
@@ -67,7 +67,7 @@ refresh = st.sidebar.button("🔄 Refresh data")
 # ============================================================
 # Constants
 # ============================================================
-FRED_SERIES = {
+FRED_SERIES: Dict[str, str] = {
     "DFII10": "10Y TIPS Real Yield",
     "T10YIE": "10Y Breakeven Inflation",
     "DGS10": "10Y Treasury Yield",
@@ -86,11 +86,11 @@ SERIES_COLORS = {
 }
 
 ETF_LABELS = {
-    "TIP": "TIPS",
-    "VTIP": "Short TIPS",
-    "SCHP": "TIPS",
+    "TIP": "Broad TIPS",
+    "VTIP": "Short-Term TIPS",
+    "SCHP": "Broad TIPS",
     "TLT": "Long Treasury",
-    "IEF": "7-10Y Treasury",
+    "IEF": "Intermediate Treasury",
     "GLD": "Gold",
     "IAU": "Gold",
     "DBC": "Commodities",
@@ -109,33 +109,61 @@ def fred_url(series_id: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_fred_series(series_id: str) -> pd.Series:
+    """
+    Load a single FRED series from CSV and return a clean Series with DatetimeIndex.
+    """
     url = fred_url(series_id)
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(pd.compat.StringIO(r.text) if hasattr(pd, "compat") else None)
-    # fallback if above fails in some pandas versions
-    if df is None or df.empty:
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    df = pd.read_csv(StringIO(response.text))
+    if df.empty or len(df.columns) < 2:
+        return pd.Series(dtype="float64", name=series_id)
 
     df.columns = ["Date", series_id]
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
-    s = df.set_index("Date")[series_id].sort_index()
-    return s
+
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+    if df.empty:
+        return pd.Series(dtype="float64", name=series_id)
+
+    series = df.set_index("Date")[series_id]
+    series.index = pd.to_datetime(series.index, errors="coerce")
+    series = series[~series.index.isna()]
+    series = series.sort_index()
+    series.name = series_id
+
+    return series
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_all_fred_data() -> pd.DataFrame:
-    data = {}
-    for sid in FRED_SERIES.keys():
-        try:
-            data[sid] = load_fred_series(sid)
-        except Exception:
-            data[sid] = pd.Series(dtype=float)
+def load_all_fred_data(years: int) -> pd.DataFrame:
+    """
+    Load all required FRED series and return a clean DataFrame.
+    Uses a date mask instead of df.last(...), which avoids DatetimeIndex errors.
+    """
+    data: Dict[str, pd.Series] = {}
 
-    df = pd.concat(data, axis=1).sort_index()
-    df = df.last(f"{fred_years * 365}D").copy()
+    for series_id in FRED_SERIES.keys():
+        try:
+            data[series_id] = load_fred_series(series_id)
+        except Exception:
+            data[series_id] = pd.Series(dtype="float64", name=series_id)
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.concat(data, axis=1)
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+
+    df = df[~df.index.isna()]
+    df = df.sort_index()
+
+    cutoff_date = pd.Timestamp.today().normalize() - pd.Timedelta(days=years * 365)
+    df = df.loc[df.index >= cutoff_date].copy()
 
     if "CPIAUCSL" in df.columns:
         df["CPI_YOY"] = df["CPIAUCSL"].pct_change(12) * 100
@@ -145,49 +173,64 @@ def load_all_fred_data() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_price_data(tickers: List[str], years: int) -> pd.DataFrame:
+    """
+    Load ETF price data from Yahoo Finance.
+    Handles both single-ticker and multi-ticker download formats safely.
+    """
     if not tickers:
         return pd.DataFrame()
 
-    end = datetime.today()
-    start = end - timedelta(days=365 * years + 20)
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=365 * years + 20)
 
     df = yf.download(
         tickers=tickers,
-        start=start.strftime("%Y-%m-%d"),
-        end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        start=start_date.strftime("%Y-%m-%d"),
+        end=(end_date + timedelta(days=1)).strftime("%Y-%m-%d"),
         auto_adjust=True,
         progress=False,
         group_by="ticker",
     )
 
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame()
 
     # Single ticker case
     if len(tickers) == 1:
-        t = tickers[0]
-        if "Close" in df.columns:
-            out = df[["Close"]].copy()
-            out.columns = [t]
-            return out.dropna(how="all")
+        ticker = tickers[0]
 
-    close_frames = []
-    for t in tickers:
         try:
-            s = df[t]["Close"].rename(t)
-            close_frames.append(s)
+            if isinstance(df.columns, pd.MultiIndex):
+                out = df[ticker][["Close"]].copy()
+                out.columns = [ticker]
+            else:
+                out = df[["Close"]].copy()
+                out.columns = [ticker]
+
+            out.index = pd.to_datetime(out.index, errors="coerce")
+            out = out[~out.index.isna()].sort_index()
+            return out.dropna(how="all")
+        except Exception:
+            return pd.DataFrame()
+
+    # Multi ticker case
+    close_frames = []
+    for ticker in tickers:
+        try:
+            if isinstance(df.columns, pd.MultiIndex):
+                s = df[ticker]["Close"].rename(ticker)
+                close_frames.append(s)
         except Exception:
             pass
 
     if not close_frames:
         return pd.DataFrame()
 
-    prices = pd.concat(close_frames, axis=1).dropna(how="all")
-    return prices
+    prices = pd.concat(close_frames, axis=1)
+    prices.index = pd.to_datetime(prices.index, errors="coerce")
+    prices = prices[~prices.index.isna()].sort_index()
 
-
-def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().fillna(0)
+    return prices.dropna(how="all")
 
 
 def normalize_prices(prices: pd.DataFrame) -> pd.DataFrame:
@@ -200,46 +243,44 @@ def compute_drawdown(prices: pd.DataFrame) -> pd.DataFrame:
     if prices.empty:
         return prices
     peak = prices.cummax()
-    dd = prices / peak - 1.0
-    return dd * 100
-
-
-def resample_monthly_last(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.resample("M").last()
+    drawdown = prices / peak - 1.0
+    return drawdown * 100
 
 
 def annualized_return(series: pd.Series) -> float:
     series = series.dropna()
     if len(series) < 2:
         return np.nan
+
     total_return = series.iloc[-1] / series.iloc[0]
     years = (series.index[-1] - series.index[0]).days / 365.25
+
     if years <= 0 or total_return <= 0:
         return np.nan
+
     return (total_return ** (1 / years) - 1) * 100
 
 
 def annualized_volatility(series: pd.Series) -> float:
-    rets = series.pct_change().dropna()
-    if len(rets) < 2:
+    returns = series.pct_change().dropna()
+    if len(returns) < 2:
         return np.nan
-    return rets.std() * np.sqrt(252) * 100
+    return returns.std() * np.sqrt(252) * 100
 
 
 def max_drawdown_pct(series: pd.Series) -> float:
-    if series.dropna().empty:
+    series = series.dropna()
+    if series.empty:
         return np.nan
     dd = series / series.cummax() - 1
     return dd.min() * 100
 
 
 def sharpe_like(series: pd.Series) -> float:
-    rets = series.pct_change().dropna()
-    if len(rets) < 2 or rets.std() == 0:
+    returns = series.pct_change().dropna()
+    if len(returns) < 2 or returns.std() == 0:
         return np.nan
-    return (rets.mean() / rets.std()) * np.sqrt(252)
+    return (returns.mean() / returns.std()) * np.sqrt(252)
 
 
 def percentile_rank(value: float, series: pd.Series) -> float:
@@ -249,12 +290,15 @@ def percentile_rank(value: float, series: pd.Series) -> float:
     return (s <= value).mean() * 100
 
 
-def latest_valid(series: pd.Series):
+def latest_valid(series: pd.Series) -> float:
     s = series.dropna()
     return s.iloc[-1] if not s.empty else np.nan
 
 
-def prev_valid(series: pd.Series, n: int = 1):
+def prev_valid_by_count(series: pd.Series, n: int = 1) -> float:
+    """
+    Return the nth previous valid observation by count.
+    """
     s = series.dropna()
     if len(s) <= n:
         return np.nan
@@ -264,25 +308,26 @@ def prev_valid(series: pd.Series, n: int = 1):
 def classify_tips_signal(df: pd.DataFrame) -> Tuple[str, str, Dict[str, float]]:
     """
     Heuristic scoring model for TIPS attractiveness.
-    Positive for:
-    - High real yield
-    - Rising or still-elevated breakeven inflation
-    - CPI above 2.2%
-    - Fed restrictive vs inflation / rate cut optional backdrop
-    Negative for:
-    - Real yield collapsing below low percentile
-    - Breakeven too rich
-    """
 
+    Positive factors:
+    - High real yield
+    - Reasonable breakeven inflation
+    - Inflation still above target
+    - Restrictive nominal/real policy backdrop
+
+    Negative factors:
+    - TIPS already too expensive via breakeven inflation
+    - Inflation collapsing too much
+    """
     real_yield = latest_valid(df["DFII10"]) if "DFII10" in df else np.nan
     breakeven = latest_valid(df["T10YIE"]) if "T10YIE" in df else np.nan
     cpi_yoy = latest_valid(df["CPI_YOY"]) if "CPI_YOY" in df else np.nan
     fedfunds = latest_valid(df["FEDFUNDS"]) if "FEDFUNDS" in df else np.nan
     dgs10 = latest_valid(df["DGS10"]) if "DGS10" in df else np.nan
 
-    real_yield_3m_ago = prev_valid(df["DFII10"], n=63) if "DFII10" in df else np.nan
-    breakeven_3m_ago = prev_valid(df["T10YIE"], n=63) if "T10YIE" in df else np.nan
-    cpi_3m_ago = prev_valid(df["CPI_YOY"], n=3) if "CPI_YOY" in df else np.nan
+    real_yield_3m_ago = prev_valid_by_count(df["DFII10"], n=63) if "DFII10" in df else np.nan
+    breakeven_3m_ago = prev_valid_by_count(df["T10YIE"], n=63) if "T10YIE" in df else np.nan
+    cpi_3m_ago = prev_valid_by_count(df["CPI_YOY"], n=3) if "CPI_YOY" in df else np.nan
 
     score = 0
 
@@ -319,8 +364,6 @@ def classify_tips_signal(df: pd.DataFrame) -> Tuple[str, str, Dict[str, float]]:
 
     # 4) Trend checks
     if not pd.isna(real_yield) and not pd.isna(real_yield_3m_ago):
-        # rising real yield is not ideal for short-term price,
-        # but it improves long-term entry attractiveness
         if real_yield > real_yield_3m_ago + 0.20:
             score += 1
         elif real_yield < real_yield_3m_ago - 0.30:
@@ -345,7 +388,7 @@ def classify_tips_signal(df: pd.DataFrame) -> Tuple[str, str, Dict[str, float]]:
         elif dgs10 < 3.0:
             score -= 1
 
-    # 6) Fed stance
+    # 6) Policy stance
     if not pd.isna(fedfunds) and not pd.isna(cpi_yoy):
         real_policy_proxy = fedfunds - cpi_yoy
         if real_policy_proxy >= 1.0:
@@ -355,13 +398,13 @@ def classify_tips_signal(df: pd.DataFrame) -> Tuple[str, str, Dict[str, float]]:
 
     if score >= 7:
         signal = "Strong Buy"
-        reason = "High real yield, acceptable breakeven, and still-elevated inflation support TIPS entry."
+        reason = "High real yield, acceptable breakeven inflation, and still-elevated inflation support TIPS entry."
     elif score >= 4:
         signal = "Buy / Accumulate"
-        reason = "Macro backdrop is generally supportive for gradual TIPS accumulation."
+        reason = "The macro backdrop is generally supportive for gradual TIPS accumulation."
     elif score >= 1:
         signal = "Neutral / Hold"
-        reason = "TIPS are reasonable, but not obviously cheap. Prefer phased buying."
+        reason = "TIPS look reasonable, but not clearly cheap. Phased buying is preferable."
     else:
         signal = "Wait / Reduce"
         reason = "The current mix of real yield, breakeven inflation, and inflation trend is not favorable."
@@ -394,15 +437,18 @@ def classify_macro_regime(df: pd.DataFrame) -> str:
         return "Late-Cycle Tight Policy"
     if cpi_yoy < 2.2 and breakeven < 2.0 and not pd.isna(unrate) and unrate >= 4.8:
         return "Growth Slowdown / Disinflation"
+
     return "Mixed Transition Regime"
 
 
 def top_asset_in_recent_window(prices: pd.DataFrame, days: int = 126) -> Tuple[str, float]:
     if prices.empty:
         return "-", np.nan
+
     recent = prices.dropna(how="all").tail(days)
     if len(recent) < 2:
         return "-", np.nan
+
     perf = (recent.iloc[-1] / recent.iloc[0] - 1) * 100
     perf = perf.sort_values(ascending=False)
     return perf.index[0], perf.iloc[0]
@@ -416,6 +462,7 @@ def make_line_chart(
     percent: bool = False,
 ) -> go.Figure:
     fig = go.Figure()
+
     for col in df.columns:
         if df[col].dropna().empty:
             continue
@@ -439,10 +486,12 @@ def make_line_chart(
         yaxis_title=yaxis_title,
         xaxis_title="Date",
     )
+
     if log_scale:
         fig.update_yaxes(type="log")
     if percent:
         fig.update_yaxes(ticksuffix="%")
+
     return fig
 
 
@@ -460,6 +509,7 @@ def make_macro_combo_chart(df: pd.DataFrame) -> go.Figure:
                 yaxis="y1",
             )
         )
+
     if "T10YIE" in df:
         fig.add_trace(
             go.Scatter(
@@ -471,6 +521,7 @@ def make_macro_combo_chart(df: pd.DataFrame) -> go.Figure:
                 yaxis="y1",
             )
         )
+
     if "CPI_YOY" in df:
         fig.add_trace(
             go.Scatter(
@@ -499,6 +550,7 @@ def make_macro_combo_chart(df: pd.DataFrame) -> go.Figure:
             showgrid=False,
         ),
     )
+
     return fig
 
 
@@ -515,12 +567,12 @@ def make_single_asset_chart(prices: pd.DataFrame, ticker: str) -> go.Figure:
         return fig
 
     s = prices[ticker].dropna()
-    ma1 = s.rolling(price_ma_short).mean()
-    ma2 = s.rolling(price_ma_long).mean()
+    ma_short = s.rolling(price_ma_short).mean()
+    ma_long = s.rolling(price_ma_long).mean()
 
     fig.add_trace(go.Scatter(x=s.index, y=s, mode="lines", name=ticker, line=dict(width=2)))
-    fig.add_trace(go.Scatter(x=ma1.index, y=ma1, mode="lines", name=f"MA {price_ma_short}", line=dict(width=1.5)))
-    fig.add_trace(go.Scatter(x=ma2.index, y=ma2, mode="lines", name=f"MA {price_ma_long}", line=dict(width=1.5)))
+    fig.add_trace(go.Scatter(x=ma_short.index, y=ma_short, mode="lines", name=f"MA {price_ma_short}", line=dict(width=1.5)))
+    fig.add_trace(go.Scatter(x=ma_long.index, y=ma_long, mode="lines", name=f"MA {price_ma_long}", line=dict(width=1.5)))
 
     fig.update_layout(
         title=f"{ticker} Price with Moving Averages",
@@ -532,8 +584,10 @@ def make_single_asset_chart(prices: pd.DataFrame, ticker: str) -> go.Figure:
         yaxis_title="Price",
         margin=dict(l=40, r=20, t=70, b=40),
     )
+
     if use_log_scale:
         fig.update_yaxes(type="log")
+
     return fig
 
 
@@ -558,12 +612,13 @@ def make_signal_gauge(score: float) -> go.Figure:
             },
         )
     )
+
     fig.update_layout(height=300, template="plotly_white", font=dict(size=font_size))
     return fig
 
 
 # ============================================================
-# Safe refresh trigger
+# Refresh
 # ============================================================
 if refresh:
     st.cache_data.clear()
@@ -573,7 +628,7 @@ if refresh:
 # Load data
 # ============================================================
 with st.spinner("Loading macro and market data..."):
-    fred_df = load_all_fred_data()
+    fred_df = load_all_fred_data(fred_years)
     price_df = load_price_data(selected_assets, lookback_years)
 
 signal, reason, signal_details = classify_tips_signal(fred_df)
@@ -587,7 +642,7 @@ leader_6m, leader_6m_perf = top_asset_in_recent_window(price_df, days=126)
 # ============================================================
 # KPI row
 # ============================================================
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 
 real_yield = signal_details.get("real_yield", np.nan)
 breakeven = signal_details.get("breakeven", np.nan)
@@ -596,12 +651,12 @@ fedfunds = signal_details.get("fedfunds", np.nan)
 dgs10 = signal_details.get("dgs10", np.nan)
 score = signal_details.get("score", np.nan)
 
-c1.metric("TIPS Signal", signal)
-c2.metric("10Y Real Yield", f"{real_yield:.2f}%" if pd.notna(real_yield) else "N/A")
-c3.metric("10Y Breakeven", f"{breakeven:.2f}%" if pd.notna(breakeven) else "N/A")
-c4.metric("CPI YoY", f"{cpi_yoy:.2f}%" if pd.notna(cpi_yoy) else "N/A")
-c5.metric("Fed Funds", f"{fedfunds:.2f}%" if pd.notna(fedfunds) else "N/A")
-c6.metric("10Y Treasury", f"{dgs10:.2f}%" if pd.notna(dgs10) else "N/A")
+col1.metric("TIPS Signal", signal)
+col2.metric("10Y Real Yield", f"{real_yield:.2f}%" if pd.notna(real_yield) else "N/A")
+col3.metric("10Y Breakeven", f"{breakeven:.2f}%" if pd.notna(breakeven) else "N/A")
+col4.metric("CPI YoY", f"{cpi_yoy:.2f}%" if pd.notna(cpi_yoy) else "N/A")
+col5.metric("Fed Funds", f"{fedfunds:.2f}%" if pd.notna(fedfunds) else "N/A")
+col6.metric("10Y Treasury", f"{dgs10:.2f}%" if pd.notna(dgs10) else "N/A")
 
 st.info(f"**Macro Regime:** {regime}")
 st.write(f"**Interpretation:** {reason}")
@@ -652,7 +707,7 @@ with tab1:
 
     st.markdown("### Quick Asset Leadership")
     if leader_6m != "-":
-        st.success(f"Best performer over ~6 months: **{leader_6m}** ({leader_6m_perf:.2f}%)")
+        st.success(f"Best performer over the last ~6 months: **{leader_6m}** ({leader_6m_perf:.2f}%)")
     else:
         st.warning("Not enough ETF price data to compute recent leadership.")
 
@@ -686,7 +741,7 @@ with tab2:
                     "10Y Breakeven Inflation (T10YIE)",
                     "CPI YoY",
                     "10Y Treasury Yield (DGS10)",
-                    "Fed Funds vs CPI",
+                    "Fed Funds minus CPI",
                 ],
                 "Current": [
                     f"{real_yield:.2f}%" if pd.notna(real_yield) else "N/A",
@@ -698,9 +753,9 @@ with tab2:
                 "Comment": [
                     "Higher usually improves long-term TIPS entry valuation",
                     "Too high can mean inflation is already priced in",
-                    "Above target supports inflation-protection demand",
+                    "Above target supports demand for inflation protection",
                     "Higher nominal yields can improve future bond entry levels",
-                    "Restrictive policy can eventually support bond disinflation setup",
+                    "Restrictive policy can support bond disinflation setups later",
                 ],
             }
         )
@@ -716,7 +771,7 @@ with tab2:
         if signal in ["Strong Buy", "Buy / Accumulate"]:
             st.write(
                 """
-- Favor **gradual accumulation** instead of one-time buying
+- Favor **gradual accumulation** over a one-time purchase
 - Consider splitting between **TIP** and **VTIP**
 - If you expect aggressive rate cuts, also compare with **TLT**
 """
@@ -724,8 +779,8 @@ with tab2:
         elif signal == "Neutral / Hold":
             st.write(
                 """
-- TIPS are reasonable, but not clearly cheap
-- Use a phased entry or pair with gold / commodities
+- TIPS look reasonable, but not clearly cheap
+- Use phased entry or pair them with gold / commodities
 - Watch whether breakeven inflation starts rising again
 """
             )
@@ -733,30 +788,30 @@ with tab2:
             st.write(
                 """
 - Waiting may be better than chasing
-- Check if breakeven inflation is already too high
+- Check whether breakeven inflation is already too high
 - Consider short-duration TIPS or a diversified inflation sleeve
 """
             )
 
     st.markdown("### Historical Percentile Context")
 
-    pct_cols = st.columns(3)
+    pct_col1, pct_col2, pct_col3 = st.columns(3)
 
-    with pct_cols[0]:
+    with pct_col1:
         real_pct = percentile_rank(real_yield, fred_df["DFII10"]) if "DFII10" in fred_df else np.nan
         st.metric("Real Yield Percentile", f"{real_pct:.1f}%" if pd.notna(real_pct) else "N/A")
 
-    with pct_cols[1]:
-        be_pct = percentile_rank(breakeven, fred_df["T10YIE"]) if "T10YIE" in fred_df else np.nan
-        st.metric("Breakeven Percentile", f"{be_pct:.1f}%" if pd.notna(be_pct) else "N/A")
+    with pct_col2:
+        breakeven_pct = percentile_rank(breakeven, fred_df["T10YIE"]) if "T10YIE" in fred_df else np.nan
+        st.metric("Breakeven Percentile", f"{breakeven_pct:.1f}%" if pd.notna(breakeven_pct) else "N/A")
 
-    with pct_cols[2]:
+    with pct_col3:
         cpi_pct = percentile_rank(cpi_yoy, fred_df["CPI_YOY"]) if "CPI_YOY" in fred_df else np.nan
         st.metric("CPI YoY Percentile", f"{cpi_pct:.1f}%" if pd.notna(cpi_pct) else "N/A")
 
-    timing_chart_cols = st.columns(2)
+    chart_col1, chart_col2 = st.columns(2)
 
-    with timing_chart_cols[0]:
+    with chart_col1:
         if {"DFII10", "T10YIE"}.issubset(fred_df.columns):
             st.plotly_chart(
                 make_line_chart(
@@ -768,11 +823,12 @@ with tab2:
                 use_container_width=True,
             )
 
-    with timing_chart_cols[1]:
+    with chart_col2:
         if "CPI_YOY" in fred_df.columns:
             cpi_plot = fred_df[["CPI_YOY"]].copy()
             if "FEDFUNDS" in fred_df.columns:
                 cpi_plot["FEDFUNDS"] = fred_df["FEDFUNDS"]
+
             st.plotly_chart(
                 make_line_chart(
                     cpi_plot,
@@ -828,13 +884,13 @@ with tab3:
             ],
             "Likely Better Asset": [
                 "TIP / VTIP / SCHP",
-                "DBC / GLD / XLE-like exposure",
+                "DBC / GLD / energy-sensitive assets",
                 "IEF / TIP",
                 "TLT",
                 "IEF / quality equities",
             ],
             "Interpretation": [
-                "TIPS benefit if inflation stays above target and real yields are attractive",
+                "TIPS benefit when inflation stays above target and real yields are attractive",
                 "Commodities and gold often react first to inflation shocks",
                 "Intermediate duration can work better than very long duration",
                 "Long Treasuries can outperform if yields fall sharply",
@@ -854,19 +910,19 @@ with tab4:
     else:
         st.markdown("## Relative ETF Performance")
 
-        perf_cols = st.columns(2)
+        perf_col1, perf_col2 = st.columns(2)
 
-        with perf_cols[0]:
+        with perf_col1:
             st.plotly_chart(
                 make_line_chart(
                     norm_prices,
-                    "Normalized Total Price Performance (Start = 100)",
+                    "Normalized Price Performance (Start = 100)",
                     yaxis_title="Indexed Price",
                 ),
                 use_container_width=True,
             )
 
-        with perf_cols[1]:
+        with perf_col2:
             if show_drawdown:
                 st.plotly_chart(
                     make_line_chart(
@@ -878,33 +934,42 @@ with tab4:
                     use_container_width=True,
                 )
 
-        # Summary stats
         rows = []
         for ticker in price_df.columns:
             s = price_df[ticker].dropna()
             if s.empty:
                 continue
+
+            six_month_return = np.nan
+            three_month_return = np.nan
+
+            if len(s) > 126:
+                six_month_return = (s.iloc[-1] / s.iloc[-126] - 1) * 100
+            if len(s) > 63:
+                three_month_return = (s.iloc[-1] / s.iloc[-63] - 1) * 100
+
             rows.append(
                 {
                     "Ticker": ticker,
                     "Role": ETF_LABELS.get(ticker, ""),
-                    "Ann.Return (%)": annualized_return(s),
+                    "Annualized Return (%)": annualized_return(s),
                     "Volatility (%)": annualized_volatility(s),
                     "Max Drawdown (%)": max_drawdown_pct(s),
                     "Sharpe-like": sharpe_like(s),
-                    "6M Return (%)": (s.iloc[-1] / s.iloc[max(0, len(s) - 126)] - 1) * 100 if len(s) > 126 else np.nan,
-                    "3M Return (%)": (s.iloc[-1] / s.iloc[max(0, len(s) - 63)] - 1) * 100 if len(s) > 63 else np.nan,
+                    "6M Return (%)": six_month_return,
+                    "3M Return (%)": three_month_return,
                 }
             )
 
         stats_df = pd.DataFrame(rows)
         if not stats_df.empty:
-            stats_df = stats_df.sort_values("Ann.Return (%)", ascending=False).reset_index(drop=True)
+            stats_df = stats_df.sort_values("Annualized Return (%)", ascending=False).reset_index(drop=True)
+
             st.markdown("### Performance Table")
             st.dataframe(
                 stats_df.style.format(
                     {
-                        "Ann.Return (%)": "{:.2f}",
+                        "Annualized Return (%)": "{:.2f}",
                         "Volatility (%)": "{:.2f}",
                         "Max Drawdown (%)": "{:.2f}",
                         "Sharpe-like": "{:.2f}",
@@ -915,7 +980,6 @@ with tab4:
                 use_container_width=True,
             )
 
-        # Rolling 3M returns
         st.markdown("### Rolling 3-Month Return")
         rolling_63 = price_df.pct_change(63) * 100
         st.plotly_chart(
@@ -943,28 +1007,28 @@ with tab5:
             key="deep_dive_ticker",
         )
 
-        top1, top2 = st.columns([1.2, 1])
+        top_left, top_right = st.columns([1.2, 1])
 
-        with top1:
+        with top_left:
             st.plotly_chart(
                 make_single_asset_chart(price_df, selected_ticker),
                 use_container_width=True,
             )
 
-        with top2:
+        with top_right:
             s = price_df[selected_ticker].dropna()
 
             st.markdown(f"## {selected_ticker}")
             st.write(f"**Role:** {ETF_LABELS.get(selected_ticker, 'Asset')}")
 
             if not s.empty:
-                latest_px = s.iloc[-1]
-                ret_1m = (s.iloc[-1] / s.iloc[max(0, len(s) - 21)] - 1) * 100 if len(s) > 21 else np.nan
-                ret_3m = (s.iloc[-1] / s.iloc[max(0, len(s) - 63)] - 1) * 100 if len(s) > 63 else np.nan
-                ret_6m = (s.iloc[-1] / s.iloc[max(0, len(s) - 126)] - 1) * 100 if len(s) > 126 else np.nan
-                ret_1y = (s.iloc[-1] / s.iloc[max(0, len(s) - 252)] - 1) * 100 if len(s) > 252 else np.nan
+                latest_price = s.iloc[-1]
+                ret_1m = (s.iloc[-1] / s.iloc[-21] - 1) * 100 if len(s) > 21 else np.nan
+                ret_3m = (s.iloc[-1] / s.iloc[-63] - 1) * 100 if len(s) > 63 else np.nan
+                ret_6m = (s.iloc[-1] / s.iloc[-126] - 1) * 100 if len(s) > 126 else np.nan
+                ret_1y = (s.iloc[-1] / s.iloc[-252] - 1) * 100 if len(s) > 252 else np.nan
 
-                st.metric("Latest Price", f"{latest_px:.2f}")
+                st.metric("Latest Price", f"{latest_price:.2f}")
                 st.metric("1M Return", f"{ret_1m:.2f}%" if pd.notna(ret_1m) else "N/A")
                 st.metric("3M Return", f"{ret_3m:.2f}%" if pd.notna(ret_3m) else "N/A")
                 st.metric("6M Return", f"{ret_6m:.2f}%" if pd.notna(ret_6m) else "N/A")
@@ -973,27 +1037,27 @@ with tab5:
 
             st.markdown("### Commentary")
             commentary = {
-                "TIP": "Broad TIPS exposure. Good when inflation remains sticky and real yields are attractive.",
-                "VTIP": "Short-duration TIPS. Usually less rate-sensitive than TIP, useful in uncertain rate environments.",
-                "SCHP": "Low-cost broad TIPS exposure similar to TIP.",
-                "TLT": "Long-duration Treasury. Usually benefits more from falling yields than from inflation protection.",
-                "IEF": "Intermediate Treasury. Balanced duration exposure, often smoother than TLT.",
+                "TIP": "Broad TIPS exposure. Useful when inflation remains sticky and real yields are attractive.",
+                "VTIP": "Short-duration TIPS. Usually less rate-sensitive than TIP in uncertain rate environments.",
+                "SCHP": "Low-cost broad TIPS exposure, similar to TIP.",
+                "TLT": "Long-duration Treasury exposure. Usually benefits more from falling yields than from inflation protection.",
+                "IEF": "Intermediate Treasury exposure. Often smoother than TLT.",
                 "GLD": "Gold exposure. Often useful for monetary debasement and geopolitical stress.",
-                "IAU": "Lower-cost gold exposure similar in role to GLD.",
+                "IAU": "Lower-cost gold exposure with a role similar to GLD.",
                 "DBC": "Broad commodities. Often reacts fastest during commodity-led inflation shocks.",
-                "PDBC": "Commodity strategy with similar inflation-hedging role to DBC.",
+                "PDBC": "Commodity strategy with a similar inflation-hedging role to DBC.",
                 "SPY": "US equities. Not a pure inflation hedge, but can work in nominal growth regimes.",
                 "QQQ": "Growth equities. Usually weaker when real yields rise sharply.",
             }
             st.write(commentary.get(selected_ticker, "No commentary available."))
 
-        # Relative comparison vs TIP
         if "TIP" in price_df.columns and selected_ticker in price_df.columns and selected_ticker != "TIP":
-            rel = price_df[selected_ticker] / price_df["TIP"] * 100
-            rel_df = pd.DataFrame({f"{selected_ticker}/TIP Relative": rel})
+            relative = price_df[selected_ticker] / price_df["TIP"] * 100
+            relative_df = pd.DataFrame({f"{selected_ticker} / TIP Relative Strength": relative})
+
             st.plotly_chart(
                 make_line_chart(
-                    rel_df.dropna(),
+                    relative_df.dropna(),
                     f"{selected_ticker} vs TIP Relative Strength",
                     yaxis_title="Relative Index",
                 ),
@@ -1002,25 +1066,25 @@ with tab5:
 
 
 # ============================================================
-# Footer / Notes
+# Footer
 # ============================================================
 st.markdown("---")
 st.markdown(
     """
 ### Notes
-- This dashboard uses **FRED** macro series and **Yahoo Finance** ETF prices.
+- This dashboard uses **FRED** macro data and **Yahoo Finance** ETF prices.
 - The **TIPS timing signal** is a practical heuristic, not investment advice.
-- For real-world use, many investors combine:
-  - **TIPS** for CPI-linked protection
-  - **TLT / IEF** for duration / recession
-  - **GLD** for currency debasement / crisis hedge
+- In practice, many macro investors combine:
+  - **TIPS** for CPI-linked inflation protection
+  - **TLT / IEF** for duration and recession sensitivity
+  - **GLD / IAU** for currency debasement and crisis hedging
   - **DBC / PDBC** for commodity inflation shocks
 
 ### Useful FRED Series
 - **DFII10**: 10-Year Treasury Inflation-Indexed Security, Constant Maturity
 - **T10YIE**: 10-Year Breakeven Inflation Rate
 - **DGS10**: 10-Year Treasury Constant Maturity Rate
-- **CPIAUCSL**: CPI Index
+- **CPIAUCSL**: Consumer Price Index
 - **FEDFUNDS**: Effective Federal Funds Rate
 """
 )
