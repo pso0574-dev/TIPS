@@ -1,359 +1,241 @@
 from __future__ import annotations
 
 import re
-import time
-from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import List, Optional
 
 import pandas as pd
 import requests
 import streamlit as st
-import xml.etree.ElementTree as ET
 
 # ============================================================
 # Page
 # ============================================================
 st.set_page_config(
-    page_title="Buffett Top 10 Compare",
-    page_icon="📊",
+    page_title="Buffett Tracker - WhaleWisdom",
+    page_icon="🐋",
     layout="wide",
 )
 
-st.title("📊 Buffett Top 10 Holdings — 3 Period Comparison")
-st.caption("Stable version: Berkshire Hathaway 13F top-10 tables")
+st.title("🐋 Buffett Top 10 Tracker — WhaleWisdom Based")
+st.caption("Direct HTML parsing from WhaleWisdom filer page")
 
 # ============================================================
 # Constants
 # ============================================================
-BERKSHIRE_CIK = "0001067983"
-SEC_SUBMISSIONS_URL = f"https://data.sec.gov/submissions/CIK{BERKSHIRE_CIK}.json"
+BASE_URL = "https://whalewisdom.com/filer/berkshire-hathaway-inc"
 
-USER_AGENT = "Mozilla/5.0 BuffettTop10Tracker/1.0 contact: pso0574@gmail.com"
-
-HEADERS_DATA = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 BuffettTracker/1.0 contact: your_email@example.com",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-HEADERS_ARCHIVE = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-}
-
-REQUEST_SLEEP = 0.2
 REQUEST_TIMEOUT = 20
 
 
 # ============================================================
-# Data class
+# Helpers
 # ============================================================
-@dataclass
-class FilingInfo:
-    accession_number: str
-    filing_date: str
-    report_date: str
-    primary_doc: str
-    accession_nodash: str
-
-
-# ============================================================
-# HTTP
-# ============================================================
-def safe_get(url: str, headers: dict, timeout: int = REQUEST_TIMEOUT) -> requests.Response:
-    r = requests.get(url, headers=headers, timeout=timeout)
+def fetch_html(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-    time.sleep(REQUEST_SLEEP)
-    return r
+    return r.text
 
 
-# ============================================================
-# SEC loaders
-# ============================================================
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def load_submissions_json() -> dict:
-    r = safe_get(SEC_SUBMISSIONS_URL, HEADERS_DATA)
-    return r.json()
+def extract_available_quarters(html: str) -> List[str]:
+    """
+    Try to extract quarter labels like 'Q4 2025' from the HTML.
+    """
+    found = re.findall(r"Q[1-4]\s20\d{2}", html)
+    quarters = []
+    for q in found:
+        if q not in quarters:
+            quarters.append(q)
+    return quarters
 
 
-def get_recent_13f_filings(submissions: dict, max_count: int = 10) -> List[FilingInfo]:
-    recent = submissions.get("filings", {}).get("recent", {})
-
-    forms = recent.get("form", [])
-    accession_numbers = recent.get("accessionNumber", [])
-    filing_dates = recent.get("filingDate", [])
-    report_dates = recent.get("reportDate", [])
-    primary_docs = recent.get("primaryDocument", [])
-
-    filings = []
-    for form, acc, fdate, rdate, pdoc in zip(
-        forms, accession_numbers, filing_dates, report_dates, primary_docs
-    ):
-        if form == "13F-HR":
-            filings.append(
-                FilingInfo(
-                    accession_number=acc,
-                    filing_date=fdate,
-                    report_date=rdate,
-                    primary_doc=pdoc,
-                    accession_nodash=acc.replace("-", ""),
-                )
-            )
-    return filings[:max_count]
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
-def filing_folder_url(filing: FilingInfo) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{int(BERKSHIRE_CIK)}/{filing.accession_nodash}/"
+def find_holdings_table(tables: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Find the table that looks like the stock holdings table.
+    Expected columns often include:
+    Stock / Company Name / % of Portfolio / Shares Owned / Value Owned
+    """
+    for df in tables:
+        x = clean_columns(df)
 
+        col_text = " | ".join(x.columns).lower()
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def discover_information_table_xml(filing: FilingInfo) -> Optional[str]:
-    folder = filing_folder_url(filing)
-    index_json_url = folder + "index.json"
-
-    r = safe_get(index_json_url, HEADERS_ARCHIVE)
-    data = r.json()
-
-    items = data.get("directory", {}).get("item", [])
-    names = [item.get("name", "") for item in items]
-
-    candidates = []
-    for name in names:
-        low = name.lower()
-        if low.endswith(".xml"):
-            candidates.append(name)
-
-    preferred_order = [
-        "infotable",
-        "informationtable",
-        "form13f",
-    ]
-
-    for keyword in preferred_order:
-        for name in candidates:
-            if keyword in name.lower():
-                return folder + name
-
-    if candidates:
-        return folder + candidates[0]
+        if (
+            ("stock" in col_text or "company name" in col_text)
+            and ("% of portfolio" in col_text or "value owned" in col_text)
+        ):
+            return x
 
     return None
 
 
-# ============================================================
-# XML parse
-# ============================================================
-def strip_ns(tag: str) -> str:
-    return tag.split("}")[-1] if "}" in tag else tag
-
-
-def child_text(elem: ET.Element, name: str) -> Optional[str]:
-    for c in elem:
-        if strip_ns(c.tag) == name:
-            return c.text.strip() if c.text else None
-    return None
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def parse_13f_information_table(xml_url: str) -> pd.DataFrame:
-    r = safe_get(xml_url, HEADERS_ARCHIVE)
-    root = ET.fromstring(r.content)
-
-    rows = []
-
-    for elem in root.iter():
-        if strip_ns(elem.tag) != "infoTable":
-            continue
-
-        issuer = child_text(elem, "nameOfIssuer")
-        title = child_text(elem, "titleOfClass")
-        cusip = child_text(elem, "cusip")
-        value_k = child_text(elem, "value")
-        put_call = child_text(elem, "putCall")
-
-        shares = None
-        for c in elem:
-            if strip_ns(c.tag) == "shrsOrPrnAmt":
-                for sub in c:
-                    if strip_ns(sub.tag) == "sshPrnamt":
-                        shares = sub.text.strip() if sub.text else None
-                        break
-
-        rows.append(
-            {
-                "issuer": issuer,
-                "class": title,
-                "cusip": cusip,
-                "value_kusd": pd.to_numeric(value_k, errors="coerce"),
-                "shares": pd.to_numeric(shares, errors="coerce"),
-                "put_call": put_call,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    df["issuer"] = df["issuer"].fillna("").str.strip()
-    df["class"] = df["class"].fillna("").str.strip()
-    df["cusip"] = df["cusip"].fillna("").str.strip()
-    df["value_usd"] = df["value_kusd"] * 1000
-
-    return df.sort_values("value_usd", ascending=False).reset_index(drop=True)
-
-
-# ============================================================
-# Build top table
-# ============================================================
-def build_top_table(df: pd.DataFrame, top_n: int = 10, include_options: bool = False) -> pd.DataFrame:
+def normalize_holdings_table(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     x = df.copy()
 
-    if not include_options and "put_call" in x.columns:
-        x = x[x["put_call"].fillna("").eq("")].copy()
+    rename_map = {}
+    for c in x.columns:
+        lc = c.lower()
 
-    if x.empty:
-        return pd.DataFrame()
+        if lc == "stock":
+            rename_map[c] = "Ticker"
+        elif "company name" in lc:
+            rename_map[c] = "Company"
+        elif "% of portfolio" in lc:
+            rename_map[c] = "Weight (%)"
+        elif "shares owned" in lc:
+            rename_map[c] = "Shares Owned"
+        elif "value owned" in lc:
+            rename_map[c] = "Value Owned"
+        elif "date" == lc:
+            rename_map[c] = "Date"
 
-    total_value = x["value_usd"].sum()
+    x = x.rename(columns=rename_map)
 
-    x = x.sort_values("value_usd", ascending=False).head(top_n).copy()
-    x["weight_pct"] = (x["value_usd"] / total_value * 100).round(2)
-    x["value_bn"] = (x["value_usd"] / 1e9).round(2)
-    x["shares_mn"] = (x["shares"] / 1e6).round(2)
+    desired = [c for c in ["Ticker", "Company", "Weight (%)", "Shares Owned", "Value Owned", "Date"] if c in x.columns]
+    x = x[desired].copy()
 
-    x = x[["issuer", "class", "value_bn", "weight_pct", "shares_mn"]].rename(
-        columns={
-            "issuer": "Issuer",
-            "class": "Class",
-            "value_bn": "Value ($Bn)",
-            "weight_pct": "Weight (%)",
-            "shares_mn": "Shares (Mn)",
-        }
-    )
+    # Remove repeated header rows if any
+    if "Ticker" in x.columns:
+        x = x[x["Ticker"].astype(str).str.lower() != "stock"].copy()
 
+    if "Weight (%)" in x.columns:
+        x["Weight_num"] = (
+            x["Weight (%)"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        x["Weight_num"] = pd.to_numeric(x["Weight_num"], errors="coerce")
+        x = x.sort_values("Weight_num", ascending=False)
+
+    x = x.head(top_n).copy()
     x.insert(0, "Rank", range(1, len(x) + 1))
+
+    if "Weight_num" in x.columns:
+        x = x.drop(columns=["Weight_num"])
+
     return x.reset_index(drop=True)
 
 
-# ============================================================
-# Main load
-# ============================================================
-status_box = st.empty()
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def load_quarter_table(quarter: Optional[str], top_n: int) -> tuple[pd.DataFrame, str]:
+    """
+    Load one quarter from WhaleWisdom.
+    We try:
+      - base page
+      - query variations
+    because WhaleWisdom page behavior may vary.
+    """
+    candidate_urls = [BASE_URL]
 
+    if quarter:
+        q = quarter.replace(" ", "%20")
+        candidate_urls.extend(
+            [
+                f"{BASE_URL}?quarter={q}",
+                f"{BASE_URL}?q={q}",
+                f"{BASE_URL}?period={q}",
+            ]
+        )
+
+    last_error = ""
+
+    for url in candidate_urls:
+        try:
+            html = fetch_html(url)
+            tables = pd.read_html(html)
+            holdings = find_holdings_table(tables)
+
+            if holdings is not None and not holdings.empty:
+                normalized = normalize_holdings_table(holdings, top_n=top_n)
+                if not normalized.empty:
+                    return normalized, url
+
+        except Exception as e:
+            last_error = str(e)
+
+    return pd.DataFrame(), last_error
+
+
+# ============================================================
+# Main
+# ============================================================
 try:
-    status_box.info("Loading Berkshire 13F filing list...")
-    submissions = load_submissions_json()
-    filings = get_recent_13f_filings(submissions, max_count=8)
+    html = fetch_html(BASE_URL)
 except Exception as e:
-    st.error(f"Failed to load SEC filing list: {e}")
+    st.error(f"Failed to load WhaleWisdom page: {e}")
     st.stop()
 
-if not filings:
-    st.error("No Berkshire 13F filings found.")
-    st.stop()
+quarters = extract_available_quarters(html)
 
-filing_map: Dict[str, FilingInfo] = {
-    f"{f.report_date} | filed {f.filing_date}": f for f in filings
-}
-labels = list(filing_map.keys())
+if not quarters:
+    st.warning("Could not detect quarter labels from WhaleWisdom page. Using generic mode.")
+    quarters = ["Current"]
 
-# ============================================================
-# Sidebar
-# ============================================================
 st.sidebar.header("Settings")
-include_options = st.sidebar.checkbox("Include options / special lines", value=False)
-top_n = st.sidebar.slider("Top N holdings", 5, 15, 10)
+top_n = st.sidebar.slider("Top N", 5, 15, 10)
 
-default_selected = labels[:3] if len(labels) >= 3 else labels
-
-selected_labels = st.sidebar.multiselect(
-    "Select up to 3 periods",
-    options=labels,
-    default=default_selected,
+default_q = quarters[:3] if len(quarters) >= 3 else quarters
+selected_quarters = st.sidebar.multiselect(
+    "Select up to 3 quarters",
+    options=quarters,
+    default=default_q,
     max_selections=3,
 )
 
-if len(selected_labels) == 0:
-    st.warning("Please select at least one period.")
+if not selected_quarters:
+    st.warning("Please select at least one quarter.")
     st.stop()
 
-selected_filings = [filing_map[x] for x in selected_labels]
+results = []
 
-# ============================================================
-# Load selected tables
-# ============================================================
-tables = []
+for q in selected_quarters:
+    with st.spinner(f"Loading {q}..."):
+        table, meta = load_quarter_table(None if q == "Current" else q, top_n)
+        results.append((q, table, meta))
 
-for filing in selected_filings:
-    try:
-        status_box.info(f"Loading {filing.report_date} ...")
-        xml_url = discover_information_table_xml(filing)
+st.subheader("Top Holdings Comparison")
+cols = st.columns(len(results))
 
-        if not xml_url:
-            tables.append((filing, pd.DataFrame(), "XML not found"))
-            continue
-
-        df = parse_13f_information_table(xml_url)
-
-        if df.empty:
-            tables.append((filing, pd.DataFrame(), "Parsed table is empty"))
-            continue
-
-        top_table = build_top_table(df, top_n=top_n, include_options=include_options)
-        tables.append((filing, top_table, None))
-
-    except Exception as e:
-        tables.append((filing, pd.DataFrame(), str(e)))
-
-status_box.success("Done.")
-
-# ============================================================
-# Summary
-# ============================================================
-st.subheader("Selected Periods")
-cols = st.columns(len(tables))
-
-for col, (filing, table, err) in zip(cols, tables):
+for col, (quarter, table, meta) in zip(cols, results):
     with col:
-        st.metric("Report Date", filing.report_date)
-        st.caption(f"Filed: {filing.filing_date}")
-        if err:
-            st.error(err)
-        else:
-            st.success(f"{len(table)} rows loaded")
-
-# ============================================================
-# 3 tables side by side
-# ============================================================
-st.subheader(f"Top {top_n} Holdings Comparison")
-cols = st.columns(len(tables))
-
-for col, (filing, table, err) in zip(cols, tables):
-    with col:
-        st.markdown(f"### {filing.report_date}")
-        if err:
-            st.warning(err)
-        elif table.empty:
-            st.warning("No data")
+        st.markdown(f"### {quarter}")
+        if table.empty:
+            st.warning("Could not parse holdings table.")
+            st.caption(f"Debug: {meta}")
         else:
             st.dataframe(table, use_container_width=True, hide_index=True, height=420)
 
-# ============================================================
-# Filing list
-# ============================================================
-st.subheader("Recent Berkshire 13F Filings")
-filings_df = pd.DataFrame(
-    [
-        {
-            "Report Date": f.report_date,
-            "Filing Date": f.filing_date,
-            "Accession Number": f.accession_number,
-        }
-        for f in filings
-    ]
-)
-st.dataframe(filings_df, use_container_width=True, hide_index=True)
+st.subheader("Merged View")
+merged = None
 
-st.caption("If SEC access is blocked, replace the User-Agent email with your real email.")
+for quarter, table, meta in results:
+    if table.empty:
+        continue
+    t = table.copy()
+    t.columns = [f"{c} ({quarter})" if c != "Rank" else "Rank" for c in t.columns]
+    if merged is None:
+        merged = t
+    else:
+        merged = merged.merge(t, on="Rank", how="outer")
+
+if merged is not None:
+    st.dataframe(merged, use_container_width=True, hide_index=True)
+else:
+    st.info("No merged table available.")
+
+st.subheader("Detected Quarters")
+st.write(quarters)
+
+st.caption("This version parses WhaleWisdom HTML directly, so it may break if the page layout changes.")
