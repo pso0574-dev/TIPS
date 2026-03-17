@@ -28,7 +28,7 @@ st.caption("Stable version: Berkshire Hathaway 13F top-10 tables")
 BERKSHIRE_CIK = "0001067983"
 SEC_SUBMISSIONS_URL = f"https://data.sec.gov/submissions/CIK{BERKSHIRE_CIK}.json"
 
-USER_AGENT = "Mozilla/5.0 BuffettTop10Tracker/1.0 contact: your_email@example.com"
+USER_AGENT = "Mozilla/5.0 BuffettTop10Tracker/1.0 contact: pso0574@gmail.com"
 
 HEADERS_DATA = {
     "User-Agent": USER_AGENT,
