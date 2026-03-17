@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import io
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
 import pandas as pd
 import plotly.express as px
@@ -12,7 +11,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-from lxml import etree
+import xml.etree.ElementTree as ET
 
 # ============================================================
 # Page config
@@ -32,20 +31,23 @@ st.caption("Official SEC 13F + free price charts via Yahoo Finance")
 BERKSHIRE_CIK = "0001067983"
 SEC_SUBMISSIONS_URL = f"https://data.sec.gov/submissions/CIK{BERKSHIRE_CIK}.json"
 
-# IMPORTANT:
-# SEC asks for a descriptive User-Agent containing contact info.
-# Replace with your real email if you use this heavily.
+# Replace contact email with your own if deploying publicly
 SEC_HEADERS = {
-    "User-Agent": "SangohPark BuffettTracker/1.0 contact@example.com",
+    "User-Agent": "BuffettTracker/1.0 your_email@example.com",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
+}
+
+SEC_ARCHIVE_HEADERS = {
+    "User-Agent": "BuffettTracker/1.0 your_email@example.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "www.sec.gov",
 }
 
-REQUEST_SLEEP = 0.2
-
+REQUEST_SLEEP = 0.25
 
 # ============================================================
-# Helpers
+# Data classes
 # ============================================================
 @dataclass
 class FilingInfo:
@@ -56,6 +58,9 @@ class FilingInfo:
     accession_nodash: str
 
 
+# ============================================================
+# HTTP helper
+# ============================================================
 def safe_get(url: str, headers: dict, timeout: int = 30) -> requests.Response:
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
@@ -63,6 +68,9 @@ def safe_get(url: str, headers: dict, timeout: int = 30) -> requests.Response:
     return r
 
 
+# ============================================================
+# SEC filing loaders
+# ============================================================
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def load_submissions_json() -> dict:
     r = safe_get(SEC_SUBMISSIONS_URL, SEC_HEADERS)
@@ -71,6 +79,7 @@ def load_submissions_json() -> dict:
 
 def get_recent_13f_filings(submissions: dict, max_count: int = 8) -> List[FilingInfo]:
     recent = submissions.get("filings", {}).get("recent", {})
+
     forms = recent.get("form", [])
     accession_numbers = recent.get("accessionNumber", [])
     filing_dates = recent.get("filingDate", [])
@@ -103,35 +112,25 @@ def filing_index_url(filing: FilingInfo) -> str:
     )
 
 
-def filing_primary_xml_url(filing: FilingInfo) -> str:
-    # Often primary doc is xml/html; kept for reference if needed
-    return filing_index_url(filing) + filing.primary_doc
-
-
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def discover_information_table_xml(filing: FilingInfo) -> Optional[str]:
-    """
-    Find the XML file for the Information Table in a filing folder.
-    """
     index_json_url = filing_index_url(filing) + "index.json"
-    r = safe_get(index_json_url, SEC_HEADERS)
+    r = safe_get(index_json_url, SEC_ARCHIVE_HEADERS)
     data = r.json()
 
     items = data.get("directory", {}).get("item", [])
     names = [item.get("name", "") for item in items]
 
-    # Prefer xml files that look like information table files
     preferred_patterns = [
         r"infotable.*\.xml$",
         r"informationtable.*\.xml$",
-        r".*form13f.*xml$",
+        r".*form13f.*\.xml$",
         r".*\.xml$",
     ]
 
     for pattern in preferred_patterns:
         for name in names:
             if re.search(pattern, name, flags=re.IGNORECASE):
-                # Avoid index/meta files if possible
                 if "primary_doc" in name.lower() and pattern != preferred_patterns[-1]:
                     continue
                 return filing_index_url(filing) + name
@@ -139,66 +138,57 @@ def discover_information_table_xml(filing: FilingInfo) -> Optional[str]:
     return None
 
 
-def _clean_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
+# ============================================================
+# XML parsing helpers
+# ============================================================
+def strip_namespace(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
 
 
-def _parse_xml_text(root, xpath_list: List[str]) -> str:
-    for xp in xpath_list:
-        val = root.xpath(xp)
-        if val:
-            if isinstance(val[0], etree._Element):
-                return _clean_text(val[0].text)
-            return _clean_text(val[0])
-    return ""
+def find_child_text(parent: ET.Element, child_name: str) -> Optional[str]:
+    for child in parent:
+        if strip_namespace(child.tag) == child_name:
+            if child.text is None:
+                return None
+            return child.text.strip()
+    return None
+
+
+def find_nested_text(parent: ET.Element, path: List[str]) -> Optional[str]:
+    current = parent
+    for level in path:
+        next_node = None
+        for child in current:
+            if strip_namespace(child.tag) == level:
+                next_node = child
+                break
+        if next_node is None:
+            return None
+        current = next_node
+    if current.text is None:
+        return None
+    return current.text.strip()
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def parse_13f_information_table(xml_url: str) -> pd.DataFrame:
-    r = safe_get(xml_url, SEC_HEADERS)
-    content = r.content
-
-    parser = etree.XMLParser(recover=True)
-    root = etree.fromstring(content, parser=parser)
-
-    # Handle possible namespaces
-    nsmap = root.nsmap.copy() if root.nsmap else {}
-    if None in nsmap:
-        nsmap["ns"] = nsmap.pop(None)
-
-    # Try with and without namespace
-    info_tables = root.xpath(".//ns:infoTable", namespaces=nsmap) if nsmap else []
-    if not info_tables:
-        info_tables = root.xpath(".//infoTable")
+    r = safe_get(xml_url, SEC_ARCHIVE_HEADERS)
+    root = ET.fromstring(r.content)
 
     rows = []
-    for node in info_tables:
-        def xp(paths: List[str]) -> str:
-            for p in paths:
-                res = node.xpath(p, namespaces=nsmap) if nsmap else node.xpath(p)
-                if res:
-                    first = res[0]
-                    if isinstance(first, etree._Element):
-                        return _clean_text(first.text)
-                    return _clean_text(first)
-            return ""
 
-        issuer = xp(["./ns:nameOfIssuer/text()", "./nameOfIssuer/text()"])
-        title = xp(["./ns:titleOfClass/text()", "./titleOfClass/text()"])
-        cusip = xp(["./ns:cusip/text()", "./cusip/text()"])
-        value_k = xp(["./ns:value/text()", "./value/text()"])  # in thousands
-        shares = xp([
-            "./ns:shrsOrPrnAmt/ns:sshPrnamt/text()",
-            "./shrsOrPrnAmt/sshPrnamt/text()",
-        ])
-        put_call = xp(["./ns:putCall/text()", "./putCall/text()"])
-        discretion = xp(["./ns:investmentDiscretion/text()", "./investmentDiscretion/text()"])
-        voting_sole = xp([
-            "./ns:votingAuthority/ns:Sole/text()",
-            "./votingAuthority/Sole/text()",
-        ])
+    for elem in root.iter():
+        if strip_namespace(elem.tag) != "infoTable":
+            continue
+
+        issuer = find_child_text(elem, "nameOfIssuer")
+        title = find_child_text(elem, "titleOfClass")
+        cusip = find_child_text(elem, "cusip")
+        value_k = find_child_text(elem, "value")
+        shares = find_nested_text(elem, ["shrsOrPrnAmt", "sshPrnamt"])
+        put_call = find_child_text(elem, "putCall")
+        discretion = find_child_text(elem, "investmentDiscretion")
+        voting_sole = find_nested_text(elem, ["votingAuthority", "Sole"])
 
         rows.append(
             {
@@ -214,23 +204,25 @@ def parse_13f_information_table(xml_url: str) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(rows)
+
     if df.empty:
         return df
 
+    df["issuer"] = df["issuer"].fillna("").str.strip()
+    df["class"] = df["class"].fillna("").str.strip()
+    df["cusip"] = df["cusip"].fillna("").str.strip()
     df["value_usd"] = df["value_kusd"] * 1000
-    df["issuer"] = df["issuer"].str.strip()
-    df["class"] = df["class"].str.strip()
-    df["cusip"] = df["cusip"].str.strip()
 
-    # 13F may include options; keep only common stock-ish holdings by default later if needed
     return df.sort_values("value_usd", ascending=False).reset_index(drop=True)
 
 
+# ============================================================
+# Comparison logic
+# ============================================================
 def build_comparison(current_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
     cur = current_df.copy()
     prv = prev_df.copy()
 
-    # Use issuer + cusip as a pragmatic key
     cur["key"] = cur["issuer"].fillna("") + "|" + cur["cusip"].fillna("")
     prv["key"] = prv["issuer"].fillna("") + "|" + prv["cusip"].fillna("")
 
@@ -242,18 +234,27 @@ def build_comparison(current_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.Data
     )
 
     merged["shares_change"] = merged["shares"] - merged["shares_prev"]
-    merged["shares_change_pct"] = merged["shares_change"] / merged["shares_prev"].replace(0, pd.NA) * 100
+    merged["shares_change_pct"] = (
+        merged["shares_change"] / merged["shares_prev"].replace(0, pd.NA) * 100
+    )
+
     total_value = merged["value_usd"].sum()
-    merged["portfolio_weight_pct"] = merged["value_usd"] / total_value * 100 if total_value else 0
+    merged["portfolio_weight_pct"] = (
+        merged["value_usd"] / total_value * 100 if total_value else 0
+    )
+
+    merged["status"] = "Unchanged"
+    merged.loc[merged["shares_prev"].isna(), "status"] = "New"
+    merged.loc[merged["shares_change"] > 0, "status"] = "Increased"
+    merged.loc[merged["shares_change"] < 0, "status"] = "Reduced"
 
     return merged.sort_values("value_usd", ascending=False).reset_index(drop=True)
 
 
+# ============================================================
+# Ticker guesser
+# ============================================================
 def try_guess_ticker(issuer: str) -> Optional[str]:
-    """
-    Simple free heuristic for major Berkshire names.
-    Extend this dictionary as needed.
-    """
     mapping = {
         "APPLE INC": "AAPL",
         "AMERICAN EXPRESS CO": "AXP",
@@ -266,11 +267,11 @@ def try_guess_ticker(issuer: str) -> Optional[str]:
         "DAVITA INC": "DVA",
         "CHUBB LIMITED": "CB",
         "VERISIGN INC": "VRSN",
+        "SIRIUS XM HOLDINGS INC": "SIRI",
         "SIRIUS XM HLDGS INC": "SIRI",
         "CITIGROUP INC": "C",
         "ALLY FINL INC": "ALLY",
         "AON PLC": "AON",
-        "LIBERTY MEDIA CORP DEL": None,  # share classes vary
         "T MOBILE US INC": "TMUS",
         "DOMINOS PIZZA INC": "DPZ",
         "POOL CORP": "POOL",
@@ -280,21 +281,50 @@ def try_guess_ticker(issuer: str) -> Optional[str]:
         "AMAZON COM INC": "AMZN",
         "NU HLDGS LTD": "NU",
         "CAPITAL ONE FINL CORP": "COF",
+        "LIBERTY MEDIA CORP DEL": None,
+        "LIBERTY SIRIUSXM GROUP": None,
     }
     key = issuer.upper().strip()
     return mapping.get(key)
 
 
+# ============================================================
+# Price data
+# ============================================================
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def load_price_history(ticker: str, period: str = "3y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-    if df is None or df.empty:
+    try:
+        df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df
+    except Exception:
         return pd.DataFrame()
-    return df
+
+
+def get_close_series(price_df: pd.DataFrame) -> pd.Series:
+    if price_df.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(price_df.columns, pd.MultiIndex):
+        try:
+            if "Close" in price_df.columns.get_level_values(0):
+                close = price_df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    return close.iloc[:, 0]
+                return close
+        except Exception:
+            pass
+        return price_df.iloc[:, 0]
+
+    if "Close" in price_df.columns:
+        return price_df["Close"]
+
+    return price_df.iloc[:, 0]
 
 
 # ============================================================
-# Load SEC filing data
+# Main load
 # ============================================================
 with st.spinner("Loading Berkshire Hathaway 13F filings from SEC..."):
     submissions = load_submissions_json()
@@ -330,17 +360,14 @@ if latest_df.empty:
 
 comparison_df = build_comparison(latest_df, previous_df)
 
-# Filter out obvious non-long-equity artifacts if desired
-show_options = st.sidebar.checkbox("Include options / special lines", value=False)
-if not show_options:
-    comparison_df = comparison_df[
-        comparison_df["put_call"].fillna("").eq("")
-    ].copy()
-
 # ============================================================
-# Sidebar controls
+# Sidebar
 # ============================================================
 st.sidebar.header("Controls")
+
+show_options = st.sidebar.checkbox("Include options / special lines", value=False)
+if not show_options:
+    comparison_df = comparison_df[comparison_df["put_call"].fillna("").eq("")].copy()
 
 top_n = st.sidebar.slider("Top holdings to show", 5, 30, 15)
 min_weight = st.sidebar.slider("Minimum weight (%)", 0.0, 10.0, 0.0, 0.1)
@@ -364,11 +391,12 @@ m3.metric("New vs prior filing", f"{new_positions}")
 m4.metric("Raised / Cut", f"{increased_positions} / {reduced_positions}")
 
 # ============================================================
-# Top holdings bar chart
+# Top holdings chart
 # ============================================================
 st.subheader("Top Holdings by Reported Value")
 
 top_df = view_df.head(top_n).copy()
+
 fig_bar = px.bar(
     top_df.sort_values("value_usd"),
     x="value_usd",
@@ -376,16 +404,65 @@ fig_bar = px.bar(
     orientation="h",
     text="portfolio_weight_pct",
 )
-fig_bar.update_traces(
-    texttemplate="%{text:.2f}%",
-    textposition="outside",
-)
+
+fig_bar.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
 fig_bar.update_layout(
     xaxis_title="Reported Value (USD)",
     yaxis_title="Issuer",
-    height=max(450, 25 * len(top_df)),
+    height=max(450, 26 * len(top_df)),
 )
+
 st.plotly_chart(fig_bar, use_container_width=True)
+
+# ============================================================
+# Position change chart
+# ============================================================
+st.subheader("Quarter-over-Quarter Share Change")
+
+change_df = view_df.head(top_n).copy()
+change_df["shares_change_mn"] = change_df["shares_change"] / 1e6
+
+fig_change = px.bar(
+    change_df.sort_values("shares_change_mn"),
+    x="shares_change_mn",
+    y="issuer",
+    orientation="h",
+    color="status",
+)
+fig_change.update_layout(
+    xaxis_title="Share Change (Millions)",
+    yaxis_title="Issuer",
+    height=max(450, 26 * len(change_df)),
+)
+st.plotly_chart(fig_change, use_container_width=True)
+
+# ============================================================
+# Pie chart
+# ============================================================
+st.subheader("Portfolio Concentration")
+
+pie_df = view_df.head(10).copy()
+others_weight = max(0.0, 100.0 - pie_df["portfolio_weight_pct"].sum())
+
+if others_weight > 0:
+    pie_df = pd.concat(
+        [
+            pie_df[["issuer", "portfolio_weight_pct"]],
+            pd.DataFrame([{"issuer": "Others", "portfolio_weight_pct": others_weight}]),
+        ],
+        ignore_index=True,
+    )
+else:
+    pie_df = pie_df[["issuer", "portfolio_weight_pct"]].copy()
+
+fig_pie = px.pie(
+    pie_df,
+    names="issuer",
+    values="portfolio_weight_pct",
+    hole=0.35,
+)
+fig_pie.update_layout(height=500)
+st.plotly_chart(fig_pie, use_container_width=True)
 
 # ============================================================
 # Holdings table
@@ -408,6 +485,7 @@ st.dataframe(
             "shares_mn",
             "shares_change_mn",
             "shares_change_pct",
+            "status",
         ]
     ].rename(
         columns={
@@ -419,6 +497,7 @@ st.dataframe(
             "shares_mn": "Shares (Mn)",
             "shares_change_mn": "Share Change (Mn)",
             "shares_change_pct": "Share Change (%)",
+            "status": "Status",
         }
     ),
     use_container_width=True,
@@ -426,74 +505,127 @@ st.dataframe(
 )
 
 # ============================================================
-# Single holding price chart
+# Price chart for selected holding
 # ============================================================
 st.subheader("Price Chart for a Selected Holding")
 
 issuer_list = view_df["issuer"].tolist()
-selected_issuer = st.selectbox("Select issuer", issuer_list, index=0)
+default_index = 0 if issuer_list else None
 
-selected_row = view_df[view_df["issuer"] == selected_issuer].iloc[0]
-guessed_ticker = try_guess_ticker(selected_issuer)
+if issuer_list:
+    selected_issuer = st.selectbox("Select issuer", issuer_list, index=default_index)
+    selected_row = view_df[view_df["issuer"] == selected_issuer].iloc[0]
+    guessed_ticker = try_guess_ticker(selected_issuer)
 
-manual_ticker = st.text_input(
-    "Ticker override (optional)",
-    value=guessed_ticker or "",
-    help="Some issuers need manual ticker input because 13F does not include ticker symbols.",
+    manual_ticker = st.text_input(
+        "Ticker override",
+        value=guessed_ticker or "",
+        help="Some 13F issuer names do not map cleanly to tickers. You can manually enter one.",
+    )
+
+    ticker_to_use = manual_ticker.strip().upper()
+
+    col1, col2 = st.columns(2)
+    col1.write(f"**Issuer:** {selected_issuer}")
+    col2.write(f"**Portfolio Weight:** {selected_row['portfolio_weight_pct']:.2f}%")
+
+    if ticker_to_use:
+        price_df = load_price_history(ticker_to_use, period=chart_period)
+
+        if price_df.empty:
+            st.warning(f"Could not load price history for {ticker_to_use}. Try another ticker.")
+        else:
+            close = get_close_series(price_df)
+
+            if close.empty:
+                st.warning("No close price series available.")
+            else:
+                fig_price = go.Figure()
+                fig_price.add_trace(
+                    go.Scatter(
+                        x=close.index,
+                        y=close.values,
+                        mode="lines",
+                        name=ticker_to_use,
+                    )
+                )
+                fig_price.update_layout(
+                    title=f"{selected_issuer} ({ticker_to_use}) Price",
+                    xaxis_title="Date",
+                    yaxis_title="Price",
+                    height=500,
+                )
+                st.plotly_chart(fig_price, use_container_width=True)
+
+                ma_df = pd.DataFrame({"Close": close})
+                ma_df["MA50"] = ma_df["Close"].rolling(50).mean()
+                ma_df["MA200"] = ma_df["Close"].rolling(200).mean()
+
+                fig_ma = go.Figure()
+                fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["Close"], mode="lines", name="Close"))
+                fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["MA50"], mode="lines", name="MA50"))
+                fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["MA200"], mode="lines", name="MA200"))
+                fig_ma.update_layout(
+                    title=f"{selected_issuer} ({ticker_to_use}) with Moving Averages",
+                    xaxis_title="Date",
+                    yaxis_title="Price",
+                    height=500,
+                )
+                st.plotly_chart(fig_ma, use_container_width=True)
+    else:
+        st.info("Enter or confirm a ticker to show the price chart.")
+else:
+    st.info("No holdings available to display.")
+
+# ============================================================
+# Compare multiple holdings
+# ============================================================
+st.subheader("Multi-Holding Relative Performance")
+
+default_choices = []
+for candidate in ["APPLE INC", "AMERICAN EXPRESS CO", "COCA COLA CO", "CHEVRON CORP NEW"]:
+    if candidate in issuer_list:
+        default_choices.append(candidate)
+
+selected_compare = st.multiselect(
+    "Select holdings to compare",
+    issuer_list,
+    default=default_choices[:4] if default_choices else issuer_list[:3],
 )
 
-ticker_to_use = manual_ticker.strip().upper()
+tickers_for_compare = {}
+for issuer in selected_compare:
+    t = try_guess_ticker(issuer)
+    if t:
+        tickers_for_compare[issuer] = t
 
-if ticker_to_use:
-    price_df = load_price_history(ticker_to_use, period=chart_period)
+if tickers_for_compare:
+    rebased_fig = go.Figure()
 
-    if price_df.empty:
-        st.warning(f"Could not load price history for {ticker_to_use}. Try another ticker.")
-    else:
-        if isinstance(price_df.columns, pd.MultiIndex):
-            # yfinance can occasionally return multiindex
-            if ("Close" in price_df.columns.get_level_values(0)):
-                close = price_df["Close"].copy()
-            else:
-                close = price_df.iloc[:, 0].copy()
-        else:
-            close = price_df["Close"] if "Close" in price_df.columns else price_df.iloc[:, 0]
-
-        fig_price = go.Figure()
-        fig_price.add_trace(
+    for issuer, ticker in tickers_for_compare.items():
+        dfp = load_price_history(ticker, period=chart_period)
+        close = get_close_series(dfp)
+        if close.empty:
+            continue
+        rebased = close / close.iloc[0] * 100
+        rebased_fig.add_trace(
             go.Scatter(
-                x=close.index,
-                y=close.values,
+                x=rebased.index,
+                y=rebased.values,
                 mode="lines",
-                name=ticker_to_use,
+                name=f"{issuer} ({ticker})",
             )
         )
-        fig_price.update_layout(
-            title=f"{selected_issuer} ({ticker_to_use}) Price",
-            xaxis_title="Date",
-            yaxis_title="Price",
-            height=500,
-        )
-        st.plotly_chart(fig_price, use_container_width=True)
 
-        # simple moving averages
-        ma_df = pd.DataFrame({"Close": close})
-        ma_df["MA50"] = ma_df["Close"].rolling(50).mean()
-        ma_df["MA200"] = ma_df["Close"].rolling(200).mean()
-
-        fig_ma = go.Figure()
-        fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["Close"], mode="lines", name="Close"))
-        fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["MA50"], mode="lines", name="MA50"))
-        fig_ma.add_trace(go.Scatter(x=ma_df.index, y=ma_df["MA200"], mode="lines", name="MA200"))
-        fig_ma.update_layout(
-            title=f"{selected_issuer} ({ticker_to_use}) with Moving Averages",
-            xaxis_title="Date",
-            yaxis_title="Price",
-            height=500,
-        )
-        st.plotly_chart(fig_ma, use_container_width=True)
+    rebased_fig.update_layout(
+        title="Relative Performance (Start = 100)",
+        xaxis_title="Date",
+        yaxis_title="Rebased Price",
+        height=550,
+    )
+    st.plotly_chart(rebased_fig, use_container_width=True)
 else:
-    st.info("Enter or confirm a ticker to show the price chart.")
+    st.info("No auto-mapped tickers available for the selected comparison set.")
 
 # ============================================================
 # Filing history table
@@ -514,6 +646,12 @@ filings_df = pd.DataFrame(
 
 st.dataframe(filings_df, use_container_width=True, hide_index=True)
 
+# ============================================================
+# Notes
+# ============================================================
 st.caption(
-    "Note: 13F data is quarterly and delayed. It shows Berkshire’s reported U.S. long holdings, not real-time trades."
+    "Note: 13F data is quarterly and delayed. It shows Berkshire's reported U.S. long holdings, not real-time trades."
+)
+st.caption(
+    "If SEC blocks requests, check your User-Agent header and use a valid contact email."
 )
