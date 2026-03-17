@@ -12,6 +12,9 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+# ============================================================
+# Page config
+# ============================================================
 st.set_page_config(
     page_title="Rates vs Equities Monitor",
     page_icon="📈",
@@ -19,8 +22,11 @@ st.set_page_config(
 )
 
 st.title("📈 Rates vs Equities Monitor")
-st.caption("Representative rates vs SPY / QQQ with preset-range synced chart updates")
+st.caption("Representative rates vs SPY / QQQ with clean preset range control")
 
+# ============================================================
+# Metadata
+# ============================================================
 FRED_SERIES_META: Dict[str, Dict[str, str]] = {
     "DFF": {"name": "Effective Fed Funds Rate", "group": "Policy"},
     "DFEDTARU": {"name": "Fed Target Upper Bound", "group": "Policy"},
@@ -71,9 +77,12 @@ RANGE_OPTIONS = {
     "10Y": 365 * 10,
     "20Y": 365 * 20,
     "Max": None,
+    "Custom": "Custom",
 }
 
-
+# ============================================================
+# Helpers
+# ============================================================
 def normalize_series(s: pd.Series) -> pd.Series:
     s = pd.to_numeric(s, errors="coerce")
     valid = s.dropna()
@@ -144,6 +153,9 @@ def first_valid_ffill(series: pd.Series) -> pd.Series:
     return out
 
 
+# ============================================================
+# Data loaders
+# ============================================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_fred_series(series_id: str) -> pd.DataFrame:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
@@ -151,6 +163,9 @@ def load_fred_series(series_id: str) -> pd.DataFrame:
     r.raise_for_status()
 
     df = pd.read_csv(StringIO(r.text))
+    if df.shape[1] < 2:
+        raise ValueError(f"Unexpected FRED response for {series_id}")
+
     df.columns = ["Date", series_id]
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
@@ -226,6 +241,9 @@ def filter_by_date(df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
     return df.loc[mask].copy()
 
 
+# ============================================================
+# Plot helpers
+# ============================================================
 def add_crisis_shading(fig: go.Figure, show_labels: bool = True) -> None:
     for crisis in CRISIS_PERIODS:
         x0 = pd.to_datetime(crisis["start"])
@@ -272,6 +290,36 @@ def apply_mode(series: pd.Series, mode: str) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def apply_common_layout(
+    fig: go.Figure,
+    title: str,
+    start_date,
+    end_date,
+    show_crisis: bool,
+    show_crisis_labels: bool,
+    show_recession: bool,
+    height: int,
+) -> go.Figure:
+    fig.update_layout(
+        title=title,
+        hovermode="x unified",
+        height=height,
+        margin=dict(l=40, r=40, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(
+            range=[pd.to_datetime(start_date), pd.to_datetime(end_date)],
+            type="date",
+        ),
+    )
+
+    if show_crisis:
+        add_crisis_shading(fig, show_crisis_labels)
+    if show_recession:
+        add_recession_shading(fig)
+
+    return fig
+
+
 def build_main_chart(
     df: pd.DataFrame,
     rate_cols: List[str],
@@ -282,6 +330,8 @@ def build_main_chart(
     show_recession: bool,
     ma_windows: List[int],
     show_ma: bool,
+    start_date,
+    end_date,
 ) -> go.Figure:
     fig = go.Figure()
     use_secondary_y = (mode == "Raw" and len(rate_cols) > 0 and len(equity_cols) > 0)
@@ -290,8 +340,11 @@ def build_main_chart(
         if col not in df.columns:
             continue
         fig.add_trace(go.Scatter(
-            x=df["Date"], y=apply_mode(df[col], mode),
-            mode="lines", name=col, connectgaps=False
+            x=df["Date"],
+            y=apply_mode(df[col], mode),
+            mode="lines",
+            name=col,
+            connectgaps=False,
         ))
 
     for col in equity_cols:
@@ -299,8 +352,11 @@ def build_main_chart(
             continue
 
         trace = go.Scatter(
-            x=df["Date"], y=apply_mode(df[col], mode),
-            mode="lines", name=col, connectgaps=False
+            x=df["Date"],
+            y=apply_mode(df[col], mode),
+            mode="lines",
+            name=col,
+            connectgaps=False,
         )
         if use_secondary_y:
             trace.yaxis = "y2"
@@ -321,14 +377,6 @@ def build_main_chart(
                     ma_trace.yaxis = "y2"
                 fig.add_trace(ma_trace)
 
-    fig.update_layout(
-        title="Representative Rates vs SPY / QQQ",
-        hovermode="x unified",
-        height=560,
-        margin=dict(l=40, r=40, t=60, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    )
-
     if use_secondary_y:
         fig.update_layout(
             yaxis=dict(title="Rates / Spread"),
@@ -337,12 +385,16 @@ def build_main_chart(
     else:
         fig.update_yaxes(title_text=mode)
 
-    if show_crisis:
-        add_crisis_shading(fig, show_crisis_labels)
-    if show_recession:
-        add_recession_shading(fig)
-
-    return fig
+    return apply_common_layout(
+        fig,
+        "Representative Rates vs SPY / QQQ",
+        start_date,
+        end_date,
+        show_crisis,
+        show_crisis_labels,
+        show_recession,
+        560,
+    )
 
 
 def build_simple_chart(
@@ -353,6 +405,8 @@ def build_simple_chart(
     show_crisis: bool,
     show_crisis_labels: bool,
     show_recession: bool,
+    start_date,
+    end_date,
 ) -> go.Figure:
     fig = go.Figure()
 
@@ -364,28 +418,24 @@ def build_simple_chart(
             y=apply_mode(df[col], mode),
             mode="lines",
             name=col,
-            connectgaps=False
+            connectgaps=False,
         ))
 
-    fig.update_layout(
-        title=title,
-        hovermode="x unified",
-        height=460,
-        margin=dict(l=40, r=40, t=60, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    return apply_common_layout(
+        fig,
+        title,
+        start_date,
+        end_date,
+        show_crisis,
+        show_crisis_labels,
+        show_recession,
+        460,
     )
 
-    if show_crisis:
-        add_crisis_shading(fig, show_crisis_labels)
-    if show_recession:
-        add_recession_shading(fig)
 
-    return fig
-
-
-# -----------------------------
+# ============================================================
 # Load data
-# -----------------------------
+# ============================================================
 with st.spinner("Loading data..."):
     data = load_all_data()
 
@@ -396,53 +446,43 @@ if data.empty:
 min_date = data["Date"].min().date()
 max_date = data["Date"].max().date()
 
-# -----------------------------
-# Session-state synced preset range
-# -----------------------------
-if "preset_range" not in st.session_state:
-    st.session_state["preset_range"] = "5Y"
-
-if "start_date" not in st.session_state:
-    st.session_state["start_date"] = max(min_date, max_date - timedelta(days=RANGE_OPTIONS["5Y"]))
-
-if "end_date" not in st.session_state:
-    st.session_state["end_date"] = max_date
-
-
-def sync_dates_from_preset():
-    preset = st.session_state["preset_range"]
-    if RANGE_OPTIONS[preset] is None:
-        st.session_state["start_date"] = min_date
-        st.session_state["end_date"] = max_date
-    else:
-        st.session_state["end_date"] = max_date
-        st.session_state["start_date"] = max(min_date, max_date - timedelta(days=RANGE_OPTIONS[preset]))
-
-
+# ============================================================
+# Sidebar controls
+# ============================================================
 st.sidebar.header("Controls")
 
-st.sidebar.selectbox(
+preset_range = st.sidebar.selectbox(
     "Preset Range",
     list(RANGE_OPTIONS.keys()),
-    key="preset_range",
-    on_change=sync_dates_from_preset,
+    index=4,  # 5Y
 )
 
-st.sidebar.date_input(
-    "Start Date",
-    min_value=min_date,
-    max_value=max_date,
-    key="start_date",
-)
+if preset_range == "Custom":
+    start_date = st.sidebar.date_input(
+        "Start Date",
+        value=max(min_date, max_date - timedelta(days=365 * 5)),
+        min_value=min_date,
+        max_value=max_date,
+        key="custom_start_date",
+    )
+    end_date = st.sidebar.date_input(
+        "End Date",
+        value=max_date,
+        min_value=min_date,
+        max_value=max_date,
+        key="custom_end_date",
+    )
+else:
+    if RANGE_OPTIONS[preset_range] is None:
+        start_date = min_date
+        end_date = max_date
+    else:
+        end_date = max_date
+        start_date = max(min_date, max_date - timedelta(days=RANGE_OPTIONS[preset_range]))
 
-st.sidebar.date_input(
-    "End Date",
-    min_value=min_date,
-    max_value=max_date,
-    key="end_date",
-)
+    st.sidebar.caption(f"Active range: {start_date} ~ {end_date}")
 
-if st.session_state["start_date"] > st.session_state["end_date"]:
+if start_date > end_date:
     st.error("Start Date must be before End Date.")
     st.stop()
 
@@ -450,19 +490,19 @@ selected_rate_series = st.sidebar.multiselect(
     "Representative Rates",
     options=AVAILABLE_MAIN_RATE_SERIES,
     default=DEFAULT_RATE_SERIES,
-    format_func=lambda x: f"{x} — {FRED_SERIES_META.get(x, {}).get('name', x)}"
+    format_func=lambda x: f"{x} — {FRED_SERIES_META.get(x, {}).get('name', x)}",
 )
 
 selected_equities = st.sidebar.multiselect(
     "Compare with Equities",
     options=["SPY", "QQQ"],
-    default=["SPY", "QQQ"]
+    default=["SPY", "QQQ"],
 )
 
 chart_mode = st.sidebar.radio(
     "Chart Mode",
     ["Raw", "Normalized (Start=100)", "Change % from Start"],
-    index=1
+    index=1,
 )
 
 show_crisis = st.sidebar.checkbox("Show Crisis Periods", value=True)
@@ -474,15 +514,11 @@ ma_windows = st.sidebar.multiselect("MA Windows", [20, 50, 100, 200], default=[5
 
 show_drawdown = st.sidebar.checkbox("Show Drawdown Chart", value=True)
 
-filtered = filter_by_date(
-    data,
-    st.session_state["start_date"],
-    st.session_state["end_date"]
-)
+filtered = filter_by_date(data, start_date, end_date)
 
-# -----------------------------
+# ============================================================
 # Snapshot
-# -----------------------------
+# ============================================================
 st.subheader("Snapshot")
 
 metric_cols = st.columns(6)
@@ -504,6 +540,9 @@ metric_cols[3].metric("10Y-2Y Spread", format_num(spread_10_2, pct=True))
 metric_cols[4].metric("SPY YTD", format_num(ytd_return(filtered, "SPY"), pct=True))
 metric_cols[5].metric("QQQ YTD", format_num(ytd_return(filtered, "QQQ"), pct=True))
 
+# ============================================================
+# Tabs
+# ============================================================
 tab_main, tab_curve, tab_inflation, tab_credit, tab_table = st.tabs(
     ["Main View", "Yield Curve", "Inflation / Real Rates", "Credit Stress", "Data Table"]
 )
@@ -521,8 +560,10 @@ with tab_main:
         show_recession=show_recession,
         ma_windows=ma_windows,
         show_ma=show_ma,
+        start_date=start_date,
+        end_date=end_date,
     )
-    st.plotly_chart(fig_main, use_container_width=True)
+    st.plotly_chart(fig_main, use_container_width=True, key="main_chart")
 
     col_a, col_b = st.columns(2)
 
@@ -536,8 +577,10 @@ with tab_main:
                 show_crisis,
                 show_crisis_labels,
                 show_recession,
+                start_date,
+                end_date,
             )
-            st.plotly_chart(fig_rates, use_container_width=True)
+            st.plotly_chart(fig_rates, use_container_width=True, key="rates_only_chart")
 
     with col_b:
         if selected_equities:
@@ -549,6 +592,8 @@ with tab_main:
                 show_crisis,
                 show_crisis_labels,
                 show_recession,
+                start_date,
+                end_date,
             )
 
             if show_ma:
@@ -564,7 +609,9 @@ with tab_main:
                                 line=dict(dash="dot"),
                                 connectgaps=False,
                             ))
-            st.plotly_chart(fig_eq, use_container_width=True)
+                fig_eq.update_xaxes(range=[pd.to_datetime(start_date), pd.to_datetime(end_date)])
+
+            st.plotly_chart(fig_eq, use_container_width=True, key="equities_only_chart")
 
     if show_drawdown and selected_equities:
         dd_fig = go.Figure()
@@ -577,18 +624,18 @@ with tab_main:
                     name=f"{eq} Drawdown",
                     connectgaps=False,
                 ))
-        dd_fig.update_layout(
-            title="Equity Drawdown vs Previous Peak",
-            hovermode="x unified",
-            height=380,
-            margin=dict(l=40, r=40, t=60, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+
+        dd_fig = apply_common_layout(
+            dd_fig,
+            "Equity Drawdown vs Previous Peak",
+            start_date,
+            end_date,
+            show_crisis,
+            show_crisis_labels,
+            show_recession,
+            380,
         )
-        if show_crisis:
-            add_crisis_shading(dd_fig, show_crisis_labels)
-        if show_recession:
-            add_recession_shading(dd_fig)
-        st.plotly_chart(dd_fig, use_container_width=True)
+        st.plotly_chart(dd_fig, use_container_width=True, key="drawdown_chart")
 
 with tab_curve:
     st.subheader("Yield Curve")
@@ -601,9 +648,19 @@ with tab_curve:
 
     with c1:
         st.plotly_chart(
-            build_simple_chart(curve_df, ["DGS3MO", "DGS2", "DGS10", "DGS30"], "Treasury Yield Levels", "Raw",
-                               show_crisis, show_crisis_labels, show_recession),
-            use_container_width=True
+            build_simple_chart(
+                curve_df,
+                ["DGS3MO", "DGS2", "DGS10", "DGS30"],
+                "Treasury Yield Levels",
+                "Raw",
+                show_crisis,
+                show_crisis_labels,
+                show_recession,
+                start_date,
+                end_date,
+            ),
+            use_container_width=True,
+            key="curve_levels_chart",
         )
 
     with c2:
@@ -615,9 +672,11 @@ with tab_curve:
             show_crisis,
             show_crisis_labels,
             show_recession,
+            start_date,
+            end_date,
         )
         fig_curve_spreads.add_hline(y=0, line_dash="dash")
-        st.plotly_chart(fig_curve_spreads, use_container_width=True)
+        st.plotly_chart(fig_curve_spreads, use_container_width=True, key="curve_spreads_chart")
 
 with tab_inflation:
     st.subheader("Inflation / Real Rates")
@@ -626,9 +685,19 @@ with tab_inflation:
 
     with i1:
         st.plotly_chart(
-            build_simple_chart(filtered, ["DGS10", "DFII10", "T10YIE"], "10Y Nominal / Real / Breakeven", "Raw",
-                               show_crisis, show_crisis_labels, show_recession),
-            use_container_width=True
+            build_simple_chart(
+                filtered,
+                ["DGS10", "DFII10", "T10YIE"],
+                "10Y Nominal / Real / Breakeven",
+                "Raw",
+                show_crisis,
+                show_crisis_labels,
+                show_recession,
+                start_date,
+                end_date,
+            ),
+            use_container_width=True,
+            key="inflation_chart",
         )
 
     with i2:
@@ -642,9 +711,11 @@ with tab_inflation:
             show_recession=show_recession,
             ma_windows=ma_windows,
             show_ma=show_ma,
+            start_date=start_date,
+            end_date=end_date,
         )
         fig_real_vs_qqq.update_layout(title="10Y Real Yield vs QQQ")
-        st.plotly_chart(fig_real_vs_qqq, use_container_width=True)
+        st.plotly_chart(fig_real_vs_qqq, use_container_width=True, key="real_vs_qqq_chart")
 
 with tab_credit:
     st.subheader("Credit Stress")
@@ -653,9 +724,19 @@ with tab_credit:
 
     with cr1:
         st.plotly_chart(
-            build_simple_chart(filtered, ["BAMLC0A0CM", "BAMLC0A4CBBB"], "Corporate Credit Spreads (OAS)", "Raw",
-                               show_crisis, show_crisis_labels, show_recession),
-            use_container_width=True
+            build_simple_chart(
+                filtered,
+                ["BAMLC0A0CM", "BAMLC0A4CBBB"],
+                "Corporate Credit Spreads (OAS)",
+                "Raw",
+                show_crisis,
+                show_crisis_labels,
+                show_recession,
+                start_date,
+                end_date,
+            ),
+            use_container_width=True,
+            key="credit_chart",
         )
 
     with cr2:
@@ -669,9 +750,11 @@ with tab_credit:
             show_recession=show_recession,
             ma_windows=ma_windows,
             show_ma=show_ma,
+            start_date=start_date,
+            end_date=end_date,
         )
         fig_credit_vs_eq.update_layout(title="BBB OAS vs SPY / QQQ")
-        st.plotly_chart(fig_credit_vs_eq, use_container_width=True)
+        st.plotly_chart(fig_credit_vs_eq, use_container_width=True, key="credit_vs_eq_chart")
 
 with tab_table:
     st.subheader("Filtered Data")
@@ -685,6 +768,7 @@ with tab_table:
         filtered[table_cols].sort_values("Date", ascending=False),
         use_container_width=True,
         hide_index=True,
+        key="filtered_table",
     )
 
     csv_data = filtered[table_cols].to_csv(index=False).encode("utf-8")
@@ -693,4 +777,5 @@ with tab_table:
         data=csv_data,
         file_name="rates_vs_equities_filtered.csv",
         mime="text/csv",
+        key="download_csv",
     )
