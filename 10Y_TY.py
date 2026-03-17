@@ -1,22 +1,8 @@
 # streamlit_app.py
-# ============================================================
-# Rates vs Equities Monitor (Fixed missing-period issue)
-# - Main tab: representative rates vs SPY / QQQ
-# - Better date alignment with business-day index
-# - Handles mixed-frequency series more robustly
-# - Crisis shading, MA options, range controls
-#
-# Run:
-#   streamlit run streamlit_app.py
-#
-# Install:
-#   pip install streamlit pandas numpy plotly requests yfinance
-# ============================================================
-
 from __future__ import annotations
 
 from io import StringIO
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -26,9 +12,6 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# ============================================================
-# Page config
-# ============================================================
 st.set_page_config(
     page_title="Rates vs Equities Monitor",
     page_icon="📈",
@@ -36,11 +19,8 @@ st.set_page_config(
 )
 
 st.title("📈 Rates vs Equities Monitor")
-st.caption("Representative rates vs SPY / QQQ with robust date alignment and missing-data handling")
+st.caption("Representative rates vs SPY / QQQ with preset-range synced chart updates")
 
-# ============================================================
-# Metadata
-# ============================================================
 FRED_SERIES_META: Dict[str, Dict[str, str]] = {
     "DFF": {"name": "Effective Fed Funds Rate", "group": "Policy"},
     "DFEDTARU": {"name": "Fed Target Upper Bound", "group": "Policy"},
@@ -93,9 +73,7 @@ RANGE_OPTIONS = {
     "Max": None,
 }
 
-# ============================================================
-# Helpers
-# ============================================================
+
 def normalize_series(s: pd.Series) -> pd.Series:
     s = pd.to_numeric(s, errors="coerce")
     valid = s.dropna()
@@ -157,10 +135,6 @@ def ytd_return(df: pd.DataFrame, col: str) -> float | None:
 
 
 def first_valid_ffill(series: pd.Series) -> pd.Series:
-    """
-    Forward fill only after the first valid observation.
-    Avoids inventing history before a series actually started.
-    """
     s = pd.to_numeric(series, errors="coerce")
     first_idx = s.first_valid_index()
     if first_idx is None:
@@ -170,19 +144,13 @@ def first_valid_ffill(series: pd.Series) -> pd.Series:
     return out
 
 
-# ============================================================
-# Data loaders
-# ============================================================
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_fred_series(series_id: str) -> pd.DataFrame:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
 
     df = pd.read_csv(StringIO(r.text))
-    if df.shape[1] < 2:
-        raise ValueError(f"Unexpected FRED response for {series_id}")
-
     df.columns = ["Date", series_id]
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
@@ -190,29 +158,23 @@ def load_fred_series(series_id: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_multiple_fred_series(series_ids: List[str]) -> pd.DataFrame:
     merged = None
-    errors = []
-
     for sid in series_ids:
         try:
             df = load_fred_series(sid)
             merged = df if merged is None else merged.merge(df, on="Date", how="outer")
         except Exception as e:
-            errors.append(f"{sid}: {e}")
-
+            st.warning(f"Failed to load {sid}: {e}")
     if merged is None:
-        merged = pd.DataFrame(columns=["Date"])
-
-    merged = merged.sort_values("Date").reset_index(drop=True)
-    return merged
+        return pd.DataFrame(columns=["Date"])
+    return merged.sort_values("Date").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_yf_close(ticker: str, start: str = "1990-01-01") -> pd.DataFrame:
     df = yf.download(ticker, start=start, auto_adjust=True, progress=False)
-
     if df.empty:
         return pd.DataFrame(columns=["Date", ticker])
 
@@ -232,12 +194,11 @@ def load_yf_close(ticker: str, start: str = "1990-01-01") -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_all_data() -> pd.DataFrame:
     fred_ids = list(set(AVAILABLE_MAIN_RATE_SERIES + ["BAMLC0A0CM", "BAMLC0A4CBBB"]))
     fred_df = load_multiple_fred_series(fred_ids)
 
-    # Use SPY instead of FRED SP500 for longer and more consistent history
     spy_df = load_yf_close("SPY", start="1993-01-01")
     qqq_df = load_yf_close("QQQ", start="1999-03-10")
 
@@ -245,17 +206,14 @@ def load_all_data() -> pd.DataFrame:
     merged = merged.merge(qqq_df, on="Date", how="outer")
     merged = merged.sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
 
-    # Build a business-day calendar for cleaner alignment
     if merged.empty:
         return merged
 
-    start = merged["Date"].min()
-    end = merged["Date"].max()
-    calendar = pd.DataFrame({"Date": pd.date_range(start=start, end=end, freq="B")})
-
+    calendar = pd.DataFrame({
+        "Date": pd.date_range(start=merged["Date"].min(), end=merged["Date"].max(), freq="B")
+    })
     merged = calendar.merge(merged, on="Date", how="left")
 
-    # Forward fill only after first valid observation
     for col in merged.columns:
         if col != "Date":
             merged[col] = first_valid_ffill(merged[col])
@@ -263,15 +221,12 @@ def load_all_data() -> pd.DataFrame:
     return merged
 
 
-def filter_by_date(df: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
+def filter_by_date(df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
     mask = (df["Date"] >= pd.to_datetime(start_date)) & (df["Date"] <= pd.to_datetime(end_date))
     return df.loc[mask].copy()
 
 
-# ============================================================
-# Plot helpers
-# ============================================================
-def add_crisis_shading(fig: go.Figure, show_labels: bool = True) -> go.Figure:
+def add_crisis_shading(fig: go.Figure, show_labels: bool = True) -> None:
     for crisis in CRISIS_PERIODS:
         x0 = pd.to_datetime(crisis["start"])
         x1 = pd.to_datetime(crisis["end"])
@@ -293,10 +248,9 @@ def add_crisis_shading(fig: go.Figure, show_labels: bool = True) -> go.Figure:
                 showarrow=False,
                 font=dict(size=10),
             )
-    return fig
 
 
-def add_recession_shading(fig: go.Figure) -> go.Figure:
+def add_recession_shading(fig: go.Figure) -> None:
     for start, end in RECESSIONS:
         fig.add_vrect(
             x0=pd.to_datetime(start),
@@ -306,7 +260,6 @@ def add_recession_shading(fig: go.Figure) -> go.Figure:
             line_width=0,
             layer="below",
         )
-    return fig
 
 
 def apply_mode(series: pd.Series, mode: str) -> pd.Series:
@@ -331,31 +284,23 @@ def build_main_chart(
     show_ma: bool,
 ) -> go.Figure:
     fig = go.Figure()
-
     use_secondary_y = (mode == "Raw" and len(rate_cols) > 0 and len(equity_cols) > 0)
 
     for col in rate_cols:
         if col not in df.columns:
             continue
-        fig.add_trace(
-            go.Scatter(
-                x=df["Date"],
-                y=apply_mode(df[col], mode),
-                mode="lines",
-                name=col,
-                connectgaps=False,
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=df["Date"], y=apply_mode(df[col], mode),
+            mode="lines", name=col, connectgaps=False
+        ))
 
     for col in equity_cols:
         if col not in df.columns:
             continue
+
         trace = go.Scatter(
-            x=df["Date"],
-            y=apply_mode(df[col], mode),
-            mode="lines",
-            name=col,
-            connectgaps=False,
+            x=df["Date"], y=apply_mode(df[col], mode),
+            mode="lines", name=col, connectgaps=False
         )
         if use_secondary_y:
             trace.yaxis = "y2"
@@ -364,10 +309,9 @@ def build_main_chart(
         if show_ma and mode == "Raw":
             price = pd.to_numeric(df[col], errors="coerce")
             for w in ma_windows:
-                ma = price.rolling(w).mean()
                 ma_trace = go.Scatter(
                     x=df["Date"],
-                    y=ma,
+                    y=price.rolling(w).mean(),
                     mode="lines",
                     name=f"{col} MA{w}",
                     line=dict(dash="dot"),
@@ -415,15 +359,13 @@ def build_simple_chart(
     for col in columns:
         if col not in df.columns:
             continue
-        fig.add_trace(
-            go.Scatter(
-                x=df["Date"],
-                y=apply_mode(df[col], mode),
-                mode="lines",
-                name=col,
-                connectgaps=False,
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=df["Date"],
+            y=apply_mode(df[col], mode),
+            mode="lines",
+            name=col,
+            connectgaps=False
+        ))
 
     fig.update_layout(
         title=title,
@@ -441,9 +383,9 @@ def build_simple_chart(
     return fig
 
 
-# ============================================================
+# -----------------------------
 # Load data
-# ============================================================
+# -----------------------------
 with st.spinner("Loading data..."):
     data = load_all_data()
 
@@ -451,25 +393,56 @@ if data.empty:
     st.error("Data could not be loaded.")
     st.stop()
 
-# ============================================================
-# Sidebar
-# ============================================================
-st.sidebar.header("Controls")
-
 min_date = data["Date"].min().date()
 max_date = data["Date"].max().date()
 
-preset_range = st.sidebar.selectbox("Preset Range", list(RANGE_OPTIONS.keys()), index=4)
+# -----------------------------
+# Session-state synced preset range
+# -----------------------------
+if "preset_range" not in st.session_state:
+    st.session_state["preset_range"] = "5Y"
 
-if RANGE_OPTIONS[preset_range] is None:
-    default_start = min_date
-else:
-    default_start = max(min_date, max_date - timedelta(days=RANGE_OPTIONS[preset_range]))
+if "start_date" not in st.session_state:
+    st.session_state["start_date"] = max(min_date, max_date - timedelta(days=RANGE_OPTIONS["5Y"]))
 
-start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=min_date, max_value=max_date)
-end_date = st.sidebar.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
+if "end_date" not in st.session_state:
+    st.session_state["end_date"] = max_date
 
-if start_date > end_date:
+
+def sync_dates_from_preset():
+    preset = st.session_state["preset_range"]
+    if RANGE_OPTIONS[preset] is None:
+        st.session_state["start_date"] = min_date
+        st.session_state["end_date"] = max_date
+    else:
+        st.session_state["end_date"] = max_date
+        st.session_state["start_date"] = max(min_date, max_date - timedelta(days=RANGE_OPTIONS[preset]))
+
+
+st.sidebar.header("Controls")
+
+st.sidebar.selectbox(
+    "Preset Range",
+    list(RANGE_OPTIONS.keys()),
+    key="preset_range",
+    on_change=sync_dates_from_preset,
+)
+
+st.sidebar.date_input(
+    "Start Date",
+    min_value=min_date,
+    max_value=max_date,
+    key="start_date",
+)
+
+st.sidebar.date_input(
+    "End Date",
+    min_value=min_date,
+    max_value=max_date,
+    key="end_date",
+)
+
+if st.session_state["start_date"] > st.session_state["end_date"]:
     st.error("Start Date must be before End Date.")
     st.stop()
 
@@ -501,11 +474,15 @@ ma_windows = st.sidebar.multiselect("MA Windows", [20, 50, 100, 200], default=[5
 
 show_drawdown = st.sidebar.checkbox("Show Drawdown Chart", value=True)
 
-filtered = filter_by_date(data, start_date, end_date)
+filtered = filter_by_date(
+    data,
+    st.session_state["start_date"],
+    st.session_state["end_date"]
+)
 
-# ============================================================
+# -----------------------------
 # Snapshot
-# ============================================================
+# -----------------------------
 st.subheader("Snapshot")
 
 metric_cols = st.columns(6)
@@ -513,8 +490,6 @@ metric_cols = st.columns(6)
 v_dgs10, d_dgs10 = latest_value_and_change(filtered["DGS10"]) if "DGS10" in filtered.columns else (None, None)
 v_dgs2, d_dgs2 = latest_value_and_change(filtered["DGS2"]) if "DGS2" in filtered.columns else (None, None)
 v_dff, d_dff = latest_value_and_change(filtered["DFF"]) if "DFF" in filtered.columns else (None, None)
-v_spy, _ = latest_value_and_change(filtered["SPY"]) if "SPY" in filtered.columns else (None, None)
-v_qqq, _ = latest_value_and_change(filtered["QQQ"]) if "QQQ" in filtered.columns else (None, None)
 
 spread_10_2 = None
 if "DGS10" in filtered.columns and "DGS2" in filtered.columns:
@@ -529,9 +504,6 @@ metric_cols[3].metric("10Y-2Y Spread", format_num(spread_10_2, pct=True))
 metric_cols[4].metric("SPY YTD", format_num(ytd_return(filtered, "SPY"), pct=True))
 metric_cols[5].metric("QQQ YTD", format_num(ytd_return(filtered, "QQQ"), pct=True))
 
-# ============================================================
-# Tabs
-# ============================================================
 tab_main, tab_curve, tab_inflation, tab_credit, tab_table = st.tabs(
     ["Main View", "Yield Curve", "Inflation / Real Rates", "Credit Stress", "Data Table"]
 )
@@ -584,31 +556,27 @@ with tab_main:
                     if eq in filtered.columns:
                         price = pd.to_numeric(filtered[eq], errors="coerce")
                         for w in ma_windows:
-                            fig_eq.add_trace(
-                                go.Scatter(
-                                    x=filtered["Date"],
-                                    y=price.rolling(w).mean(),
-                                    mode="lines",
-                                    name=f"{eq} MA{w}",
-                                    line=dict(dash="dot"),
-                                    connectgaps=False,
-                                )
-                            )
+                            fig_eq.add_trace(go.Scatter(
+                                x=filtered["Date"],
+                                y=price.rolling(w).mean(),
+                                mode="lines",
+                                name=f"{eq} MA{w}",
+                                line=dict(dash="dot"),
+                                connectgaps=False,
+                            ))
             st.plotly_chart(fig_eq, use_container_width=True)
 
     if show_drawdown and selected_equities:
         dd_fig = go.Figure()
         for eq in selected_equities:
             if eq in filtered.columns:
-                dd_fig.add_trace(
-                    go.Scatter(
-                        x=filtered["Date"],
-                        y=compute_drawdown(filtered[eq]),
-                        mode="lines",
-                        name=f"{eq} Drawdown",
-                        connectgaps=False,
-                    )
-                )
+                dd_fig.add_trace(go.Scatter(
+                    x=filtered["Date"],
+                    y=compute_drawdown(filtered[eq]),
+                    mode="lines",
+                    name=f"{eq} Drawdown",
+                    connectgaps=False,
+                ))
         dd_fig.update_layout(
             title="Equity Drawdown vs Previous Peak",
             hovermode="x unified",
@@ -632,16 +600,11 @@ with tab_curve:
     c1, c2 = st.columns(2)
 
     with c1:
-        fig_curve_levels = build_simple_chart(
-            curve_df,
-            ["DGS3MO", "DGS2", "DGS10", "DGS30"],
-            "Treasury Yield Levels",
-            "Raw",
-            show_crisis,
-            show_crisis_labels,
-            show_recession,
+        st.plotly_chart(
+            build_simple_chart(curve_df, ["DGS3MO", "DGS2", "DGS10", "DGS30"], "Treasury Yield Levels", "Raw",
+                               show_crisis, show_crisis_labels, show_recession),
+            use_container_width=True
         )
-        st.plotly_chart(fig_curve_levels, use_container_width=True)
 
     with c2:
         fig_curve_spreads = build_simple_chart(
@@ -662,16 +625,11 @@ with tab_inflation:
     i1, i2 = st.columns(2)
 
     with i1:
-        fig_infl = build_simple_chart(
-            filtered,
-            ["DGS10", "DFII10", "T10YIE"],
-            "10Y Nominal / Real / Breakeven",
-            "Raw",
-            show_crisis,
-            show_crisis_labels,
-            show_recession,
+        st.plotly_chart(
+            build_simple_chart(filtered, ["DGS10", "DFII10", "T10YIE"], "10Y Nominal / Real / Breakeven", "Raw",
+                               show_crisis, show_crisis_labels, show_recession),
+            use_container_width=True
         )
-        st.plotly_chart(fig_infl, use_container_width=True)
 
     with i2:
         fig_real_vs_qqq = build_main_chart(
@@ -694,16 +652,11 @@ with tab_credit:
     cr1, cr2 = st.columns(2)
 
     with cr1:
-        fig_credit = build_simple_chart(
-            filtered,
-            ["BAMLC0A0CM", "BAMLC0A4CBBB"],
-            "Corporate Credit Spreads (OAS)",
-            "Raw",
-            show_crisis,
-            show_crisis_labels,
-            show_recession,
+        st.plotly_chart(
+            build_simple_chart(filtered, ["BAMLC0A0CM", "BAMLC0A4CBBB"], "Corporate Credit Spreads (OAS)", "Raw",
+                               show_crisis, show_crisis_labels, show_recession),
+            use_container_width=True
         )
-        st.plotly_chart(fig_credit, use_container_width=True)
 
     with cr2:
         fig_credit_vs_eq = build_main_chart(
