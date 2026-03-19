@@ -8,6 +8,7 @@
 # - Auto dual-axis recommendation when rate assets are selected
 # - Rates vs Equity tab
 # - Scatter aggregation: Daily / Weekly / Monthly
+# - Correlation heatmap
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -24,7 +25,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -271,6 +272,55 @@ def resample_for_scatter(rate_series: pd.Series, equity_series: pd.Series, freq_
     ).dropna()
 
     return df
+
+
+def transform_series_for_corr(series: pd.Series, asset_type: str, freq_label: str) -> pd.Series:
+    s = series.dropna().sort_index()
+    if s.empty:
+        return pd.Series(dtype=float)
+
+    if freq_label == "Daily":
+        base = s
+    elif freq_label == "Weekly":
+        base = s.resample("W-FRI").last()
+    elif freq_label == "Monthly":
+        base = s.resample("M").last()
+    else:
+        base = s
+
+    if asset_type == "rate":
+        return base.diff()
+    return base.pct_change()
+
+
+def build_corr_input_map(
+    series_map: Dict[str, pd.Series],
+    freq_label: str,
+    selected_graph_period: str,
+) -> Dict[str, pd.Series]:
+    selected_assets: List[Tuple[str, str, str]] = [
+        ("WTI Crude Oil", "CL=F", "price"),
+        ("Gold", "GC=F", "price"),
+        ("Bitcoin / EUR", "BTC-EUR", "price"),
+        ("S&P 500", "^GSPC", "price"),
+        ("Nasdaq 100", "^NDX", "price"),
+        ("USD/KRW", "KRW=X", "price"),
+        ("EUR/KRW", "EURKRW=X", "price"),
+        ("US 10Y Yield", "DGS10", "rate"),
+        ("US 2Y Yield", "DGS2", "rate"),
+        ("US 3M Yield", "DGS3MO", "rate"),
+        ("US 10Y-2Y Spread", "SPREAD_10Y_2Y", "rate"),
+        ("US 10Y-3M Spread", "SPREAD_10Y_3M", "rate"),
+    ]
+
+    out: Dict[str, pd.Series] = {}
+    for name, symbol, asset_type in selected_assets:
+        raw = filter_series_by_period(series_map.get(symbol, pd.Series(dtype=float)), selected_graph_period)
+        tr = transform_series_for_corr(raw, asset_type, freq_label)
+        if not tr.empty:
+            out[name] = tr
+
+    return out
 
 
 # ============================================================
@@ -762,6 +812,39 @@ def make_scatter_with_regression(df: pd.DataFrame, title: str, x_title: str, y_t
     return fig
 
 
+def make_correlation_heatmap(corr_df: pd.DataFrame, title: str) -> go.Figure:
+    if corr_df.empty:
+        return go.Figure()
+
+    z = corr_df.values
+    x = list(corr_df.columns)
+    y = list(corr_df.index)
+
+    text = [[f"{v:.2f}" if pd.notna(v) else "" for v in row] for row in z]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=x,
+            y=y,
+            zmin=-1,
+            zmax=1,
+            text=text,
+            texttemplate="%{text}",
+            hovertemplate="X=%{x}<br>Y=%{y}<br>Corr=%{z:.2f}<extra></extra>",
+            colorbar=dict(title="Corr"),
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        height=720,
+        margin=dict(l=40, r=20, t=50, b=120),
+        xaxis=dict(tickangle=-45),
+    )
+    return fig
+
+
 # ============================================================
 # Sidebar
 # ============================================================
@@ -1142,7 +1225,30 @@ with tab6:
         )
         st.plotly_chart(fig_scatter_ndx, use_container_width=True)
 
-        st.markdown("#### 5) Latest correlation snapshot")
+        st.markdown("#### 5) Correlation heatmap")
+        heatmap_freq = st.selectbox(
+            "Heatmap aggregation",
+            options=["Daily", "Weekly", "Monthly"],
+            index=1,
+            key="heatmap_freq",
+        )
+
+        corr_input_map = build_corr_input_map(series_map, heatmap_freq, selected_graph_period)
+        if corr_input_map:
+            corr_input_df = pd.concat(corr_input_map, axis=1).dropna(how="all")
+            corr_matrix = corr_input_df.corr()
+            fig_heatmap = make_correlation_heatmap(
+                corr_matrix,
+                title=f"Cross-Asset Correlation Heatmap ({heatmap_freq}, {selected_graph_period})",
+            )
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+
+            with st.expander("Show correlation matrix table"):
+                st.dataframe(corr_matrix.round(3), use_container_width=True)
+        else:
+            st.info("Not enough data to build the heatmap.")
+
+        st.markdown("#### 6) Latest correlation snapshot")
         latest_corr_rows = []
         for name, s in corr_map.items():
             val = latest_value(s)
