@@ -2,10 +2,12 @@
 # ============================================================
 # Global Macro Monitoring Dashboard
 # - Oil / Rates / Gold / BTC / Equity / FX
-# - Period changes: 3M / 6M / 1Y / 5Y / 10Y
-# - Summary table + charts + signals
+# - Current level + 3M / 6M / 1Y / 5Y / 10Y changes
+# - Summary table + signals
+# - Multi-Asset Trend supports rates/spreads
+# - Auto dual-axis recommendation when rate assets are selected
 # - Rates vs Equity tab
-# - Multi-Asset Trend now supports rates/spreads too
+# - Scatter aggregation: Daily / Weekly / Monthly
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -42,7 +44,9 @@ st.set_page_config(
 )
 
 st.title("🌍 Global Macro Monitoring Dashboard")
-st.caption("Oil / Rates / Gold / BTC / Equity / FX • Current level + 3M / 6M / 1Y / 5Y / 10Y changes")
+st.caption(
+    "Oil / Rates / Gold / BTC / Equity / FX • Current level + 3M / 6M / 1Y / 5Y / 10Y changes"
+)
 
 # ============================================================
 # Constants
@@ -88,9 +92,16 @@ ASSET_CONFIG = [
     {"category": "FX", "asset": "EUR/KRW", "symbol": "EURKRW=X", "source": "Yahoo", "unit": "KRW per EUR", "type": "price"},
 ]
 
-# Only limited fallback for 10Y if FRED is unavailable
 FRED_FALLBACK = {
     "DGS10": "^TNX",
+}
+
+RATE_ASSETS = {
+    "US 10Y Yield",
+    "US 2Y Yield",
+    "US 3M Yield",
+    "US 10Y-2Y Spread",
+    "US 10Y-3M Spread",
 }
 
 # ============================================================
@@ -148,12 +159,14 @@ def latest_value(series: pd.Series) -> Optional[float]:
 def nearest_value(series: pd.Series, target_date: pd.Timestamp, tolerance_days: int = 10) -> Optional[float]:
     if series.empty:
         return None
+
     s = series.dropna().sort_index()
     if s.empty:
         return None
 
     idx = s.index.searchsorted(target_date, side="right") - 1
     candidate = None
+
     if idx >= 0:
         candidate_date = s.index[idx]
         if abs((target_date - candidate_date).days) <= tolerance_days:
@@ -218,8 +231,50 @@ def filter_series_by_period(series: pd.Series, period_label: str) -> pd.Series:
     return series.loc[series.index >= start].dropna()
 
 
+def get_row_value(df: pd.DataFrame, asset_name: str, col: str = "Current_raw") -> Optional[float]:
+    try:
+        return safe_float(df.loc[df["Asset"] == asset_name, col].iloc[0])
+    except Exception:
+        return None
+
+
+def resample_for_scatter(rate_series: pd.Series, equity_series: pd.Series, freq_label: str) -> pd.DataFrame:
+    rate_series = rate_series.dropna().sort_index()
+    equity_series = equity_series.dropna().sort_index()
+
+    if rate_series.empty or equity_series.empty:
+        return pd.DataFrame(columns=["rate_change", "equity_return"])
+
+    if freq_label == "Daily":
+        rate_change = rate_series.diff()
+        equity_return = equity_series.pct_change()
+
+    elif freq_label == "Weekly":
+        rate_rs = rate_series.resample("W-FRI").last()
+        eq_rs = equity_series.resample("W-FRI").last()
+        rate_change = rate_rs.diff()
+        equity_return = eq_rs.pct_change()
+
+    elif freq_label == "Monthly":
+        rate_rs = rate_series.resample("M").last()
+        eq_rs = equity_series.resample("M").last()
+        rate_change = rate_rs.diff()
+        equity_return = eq_rs.pct_change()
+
+    else:
+        rate_change = rate_series.diff()
+        equity_return = equity_series.pct_change()
+
+    df = pd.concat(
+        [rate_change.rename("rate_change"), equity_return.rename("equity_return")],
+        axis=1
+    ).dropna()
+
+    return df
+
+
 # ============================================================
-# Signals
+# Signal logic
 # ============================================================
 def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: Optional[float]) -> str:
     asset = row["Asset"]
@@ -234,7 +289,7 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
         if asset == "US 10Y Yield":
             if curr >= 4.5:
                 return "Tight"
-            elif curr <= 3.0:
+            if curr <= 3.0:
                 return "Loose"
             return "Neutral"
         if asset == "US 2Y Yield":
@@ -245,7 +300,7 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "WTI Crude Oil":
         if ch_3m is not None and ch_3m >= 10:
             return "Inflation Watch"
-        elif ch_3m is not None and ch_3m <= -10:
+        if ch_3m is not None and ch_3m <= -10:
             return "Demand Weakness"
         return "Neutral"
 
@@ -257,14 +312,14 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "Bitcoin / EUR":
         if ch_3m is not None and ch_3m > 15:
             return "Risk-On"
-        elif ch_3m is not None and ch_3m < -15:
+        if ch_3m is not None and ch_3m < -15:
             return "Risk-Off"
         return "Volatile"
 
     if asset == "S&P 500":
         if ch_1y is not None and ch_1y > 10:
             return "Growth"
-        elif ch_1y is not None and ch_1y < -10:
+        if ch_1y is not None and ch_1y < -10:
             return "Weakness"
         return "Neutral"
 
@@ -276,28 +331,28 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "USD/KRW":
         if ch_3m is not None and ch_3m > 3:
             return "KRW Weakness"
-        elif ch_3m is not None and ch_3m < -3:
+        if ch_3m is not None and ch_3m < -3:
             return "KRW Strength"
         return "Neutral"
 
     if asset == "EUR/KRW":
         if ch_3m is not None and ch_3m > 3:
             return "EUR Strong"
-        elif ch_3m is not None and ch_3m < -3:
+        if ch_3m is not None and ch_3m < -3:
             return "EUR Weak"
         return "Neutral"
 
     if asset == "US 10Y-2Y Spread" and spread_10y_2y is not None:
         if spread_10y_2y < 0:
             return "Inverted"
-        elif spread_10y_2y < 0.5:
+        if spread_10y_2y < 0.5:
             return "Flat"
         return "Steep"
 
     if asset == "US 10Y-3M Spread" and spread_10y_3m is not None:
         if spread_10y_3m < 0:
             return "Inverted"
-        elif spread_10y_3m < 0.5:
+        if spread_10y_3m < 0.5:
             return "Flat"
         return "Steep"
 
@@ -319,6 +374,7 @@ def load_yahoo_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> p
             interval="1d",
             threads=False,
         )
+
         if df is None or df.empty:
             return pd.Series(dtype=float)
 
@@ -340,6 +396,7 @@ def load_yahoo_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> p
         s = pd.to_numeric(s, errors="coerce")
         s.index = pd.to_datetime(s.index).tz_localize(None)
         return s.dropna()
+
     except Exception:
         return pd.Series(dtype=float)
 
@@ -375,6 +432,7 @@ def load_fred_series(series_id: str, start: pd.Timestamp, end: pd.Timestamp, api
         s = df.set_index("date")["value"].sort_index().dropna()
         s.index = s.index.tz_localize(None)
         return s
+
     except Exception:
         return pd.Series(dtype=float)
 
@@ -394,7 +452,6 @@ def load_all_series() -> Dict[str, pd.Series]:
         elif src == "FRED":
             s = load_fred_series(sym, START_DATE, TODAY, api_key)
 
-            # limited fallback only for DGS10
             if s.empty and sym in FRED_FALLBACK:
                 fb = FRED_FALLBACK[sym]
                 s_fb = load_yahoo_history(fb, START_DATE, TODAY)
@@ -410,7 +467,6 @@ def load_all_series() -> Dict[str, pd.Series]:
     d2 = out.get("DGS2", pd.Series(dtype=float))
     d3m = out.get("DGS3MO", pd.Series(dtype=float))
 
-    # Only compute spreads if both true series exist
     if not d10.empty and not d2.empty:
         aligned_10_2 = pd.concat([d10.rename("10Y"), d2.rename("2Y")], axis=1).dropna()
         out["SPREAD_10Y_2Y"] = aligned_10_2["10Y"] - aligned_10_2["2Y"]
@@ -469,7 +525,6 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
         row["Current"] = format_current(current, unit, asset_type)
         rows.append(row)
 
-    # Derived spreads
     for spread_symbol, spread_name in [
         ("SPREAD_10Y_2Y", "US 10Y-2Y Spread"),
         ("SPREAD_10Y_3M", "US 10Y-3M Spread"),
@@ -501,10 +556,12 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
 
     spread_10y_2y = None
     spread_10y_3m = None
+
     try:
         spread_10y_2y = float(df.loc[df["Asset"] == "US 10Y-2Y Spread", "Current_raw"].iloc[0])
     except Exception:
         pass
+
     try:
         spread_10y_3m = float(df.loc[df["Asset"] == "US 10Y-3M Spread", "Current_raw"].iloc[0])
     except Exception:
@@ -514,6 +571,7 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
         lambda r: build_signal(r, spread_10y_2y=spread_10y_2y, spread_10y_3m=spread_10y_3m),
         axis=1,
     )
+
     return df
 
 
@@ -528,7 +586,7 @@ def color_change_cell(val: str) -> str:
         num = float(s)
         if num > 0:
             return "color: #0a7f2e; font-weight: 600;"
-        elif num < 0:
+        if num < 0:
             return "color: #b00020; font-weight: 600;"
         return "color: #666666;"
     except Exception:
@@ -546,6 +604,8 @@ def color_signal_cell(val: str) -> str:
         "Inverted": "#b00020",
         "KRW Weakness": "#b00020",
         "EUR Strong": "#0a4ea1",
+        "Steep": "#0a7f2e",
+        "Flat": "#b36b00",
     }
     color = mapping.get(val, "#444444")
     return f"color: {color}; font-weight: 600;"
@@ -561,6 +621,7 @@ def make_line_chart(
     yaxis_title: str = "",
 ) -> go.Figure:
     fig = go.Figure()
+
     for name, series in series_dict.items():
         s = series.dropna()
         if s.empty:
@@ -594,13 +655,29 @@ def make_dual_axis_chart(
         s = s.dropna()
         if s.empty:
             continue
-        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name, yaxis="y"))
+        fig.add_trace(
+            go.Scatter(
+                x=s.index,
+                y=s.values,
+                mode="lines",
+                name=name,
+                yaxis="y",
+            )
+        )
 
     for name, s in right_series.items():
         s = s.dropna()
         if s.empty:
             continue
-        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name, yaxis="y2"))
+        fig.add_trace(
+            go.Scatter(
+                x=s.index,
+                y=s.values,
+                mode="lines",
+                name=name,
+                yaxis="y2",
+            )
+        )
 
     fig.update_layout(
         title=title,
@@ -643,6 +720,44 @@ def make_bar_chart(summary_df: pd.DataFrame, period_col: str, asset_filter: str)
         margin=dict(l=40, r=20, t=50, b=80),
         xaxis_title="Asset",
         yaxis_title="Change (% for price assets, pp for rate assets)",
+    )
+    return fig
+
+
+def make_scatter_with_regression(df: pd.DataFrame, title: str, x_title: str, y_title: str) -> go.Figure:
+    fig = go.Figure()
+
+    if not df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=df["rate_change"],
+                y=df["equity_return"],
+                mode="markers",
+                name="Observations",
+                text=[d.strftime("%Y-%m-%d") for d in df.index],
+                hovertemplate="Date=%{text}<br>Rate change=%{x:.4f}<br>Equity return=%{y:.4f}<extra></extra>",
+            )
+        )
+
+        if len(df) >= 2:
+            slope, intercept = np.polyfit(df["rate_change"], df["equity_return"], 1)
+            x_line = np.linspace(df["rate_change"].min(), df["rate_change"].max(), 100)
+            y_line = slope * x_line + intercept
+            fig.add_trace(
+                go.Scatter(
+                    x=x_line,
+                    y=y_line,
+                    mode="lines",
+                    name=f"Fit (slope={slope:.3f})",
+                )
+            )
+
+    fig.update_layout(
+        title=title,
+        height=520,
+        margin=dict(l=40, r=20, t=50, b=40),
+        xaxis_title=x_title,
+        yaxis_title=y_title,
     )
     return fig
 
@@ -747,12 +862,6 @@ st.dataframe(styled, use_container_width=True, hide_index=True)
 # ============================================================
 st.subheader("Quick Risk Snapshot")
 
-def get_row_value(df: pd.DataFrame, asset_name: str, col: str = "Current_raw") -> Optional[float]:
-    try:
-        return safe_float(df.loc[df["Asset"] == asset_name, col].iloc[0])
-    except Exception:
-        return None
-
 oil_3m = get_row_value(summary_df, "WTI Crude Oil", "3M_raw")
 gold_1y = get_row_value(summary_df, "Gold", "1Y_raw")
 btc_3m = get_row_value(summary_df, "Bitcoin / EUR", "3M_raw")
@@ -800,7 +909,14 @@ with tab1:
         "EUR/KRW": "EURKRW=X",
     }
 
-    default_assets = ["WTI Crude Oil", "US 10Y Yield", "Gold", "Bitcoin / EUR", "S&P 500", "USD/KRW"]
+    default_assets = [
+        "WTI Crude Oil",
+        "US 10Y Yield",
+        "Gold",
+        "Bitcoin / EUR",
+        "S&P 500",
+        "USD/KRW",
+    ]
 
     selected_assets = st.multiselect(
         "Select assets",
@@ -808,9 +924,15 @@ with tab1:
         default=default_assets,
     )
 
+    has_rate_asset = any(asset in RATE_ASSETS for asset in selected_assets)
+
+    if has_rate_asset:
+        st.info("Rate/spread series detected. Dual-axis view is recommended for readability.")
+
     multi_chart_mode = st.radio(
         "Chart Mode",
         ["Single Axis", "Dual Axis (Rates left / Others right)"],
+        index=1 if has_rate_asset else 0,
         horizontal=True,
     )
 
@@ -820,14 +942,6 @@ with tab1:
         s = filter_series_by_period(series_map.get(sym, pd.Series(dtype=float)), selected_graph_period)
         if not s.empty:
             chart_map[name] = s
-
-    rate_assets = {
-        "US 10Y Yield",
-        "US 2Y Yield",
-        "US 3M Yield",
-        "US 10Y-2Y Spread",
-        "US 10Y-3M Spread",
-    }
 
     if multi_chart_mode == "Single Axis":
         fig = make_line_chart(
@@ -842,7 +956,7 @@ with tab1:
         right_map = {}
 
         for name, s in chart_map.items():
-            if name in rate_assets:
+            if name in RATE_ASSETS:
                 left_map[name] = normalize_to_100(s) if normalize_chart else s
             else:
                 right_map[name] = normalize_to_100(s) if normalize_chart else s
@@ -864,14 +978,26 @@ with tab2:
         "US 2Y Yield": filter_series_by_period(series_map.get("DGS2", pd.Series(dtype=float)), selected_graph_period),
         "US 3M Yield": filter_series_by_period(series_map.get("DGS3MO", pd.Series(dtype=float)), selected_graph_period),
     }
-    fig_rates = make_line_chart(rate_map, title=f"US Rates ({selected_graph_period})", normalize=False, yaxis_title="%")
+
+    fig_rates = make_line_chart(
+        rate_map,
+        title=f"US Rates ({selected_graph_period})",
+        normalize=False,
+        yaxis_title="%",
+    )
     st.plotly_chart(fig_rates, use_container_width=True)
 
     spread_map = {
         "10Y-2Y Spread": filter_series_by_period(series_map.get("SPREAD_10Y_2Y", pd.Series(dtype=float)), selected_graph_period),
         "10Y-3M Spread": filter_series_by_period(series_map.get("SPREAD_10Y_3M", pd.Series(dtype=float)), selected_graph_period),
     }
-    fig_spreads = make_line_chart(spread_map, title=f"Yield Curve Spreads ({selected_graph_period})", normalize=False, yaxis_title="pp")
+
+    fig_spreads = make_line_chart(
+        spread_map,
+        title=f"Yield Curve Spreads ({selected_graph_period})",
+        normalize=False,
+        yaxis_title="pp",
+    )
     st.plotly_chart(fig_spreads, use_container_width=True)
 
 with tab3:
@@ -882,6 +1008,7 @@ with tab3:
         "Dow Jones": filter_series_by_period(series_map.get("^DJI", pd.Series(dtype=float)), selected_graph_period),
         "Nasdaq 100": filter_series_by_period(series_map.get("^NDX", pd.Series(dtype=float)), selected_graph_period),
     }
+
     fig_eq = make_line_chart(
         equity_map,
         title=f"US Equity Indices ({selected_graph_period})",
@@ -897,6 +1024,7 @@ with tab4:
         "USD/KRW": filter_series_by_period(series_map.get("KRW=X", pd.Series(dtype=float)), selected_graph_period),
         "EUR/KRW": filter_series_by_period(series_map.get("EURKRW=X", pd.Series(dtype=float)), selected_graph_period),
     }
+
     fig_fx = make_line_chart(
         fx_map,
         title=f"KRW FX Pairs ({selected_graph_period})",
@@ -962,6 +1090,7 @@ with tab6:
             "Rolling correlation window",
             options=[20, 30, 60, 90],
             index=1,
+            key="corr_window",
         )
 
         d10_chg = compute_diff(d10)
@@ -986,7 +1115,34 @@ with tab6:
         )
         st.plotly_chart(fig_corr, use_container_width=True)
 
-        st.markdown("#### 4) Latest correlation snapshot")
+        st.markdown("#### 4) Scatter relation")
+        scatter_freq = st.selectbox(
+            "Scatter aggregation",
+            options=["Daily", "Weekly", "Monthly"],
+            index=1,
+            key="scatter_freq",
+        )
+
+        scatter_df_spx = resample_for_scatter(d10, spx, scatter_freq)
+        scatter_df_ndx = resample_for_scatter(d10, ndx, scatter_freq)
+
+        fig_scatter_spx = make_scatter_with_regression(
+            scatter_df_spx,
+            title=f"10Y Yield Change vs S&P500 Return ({scatter_freq}, {selected_graph_period})",
+            x_title=f"10Y yield change ({scatter_freq.lower()}) in pp",
+            y_title=f"S&P500 return ({scatter_freq.lower()})",
+        )
+        st.plotly_chart(fig_scatter_spx, use_container_width=True)
+
+        fig_scatter_ndx = make_scatter_with_regression(
+            scatter_df_ndx,
+            title=f"10Y Yield Change vs Nasdaq100 Return ({scatter_freq}, {selected_graph_period})",
+            x_title=f"10Y yield change ({scatter_freq.lower()}) in pp",
+            y_title=f"Nasdaq100 return ({scatter_freq.lower()})",
+        )
+        st.plotly_chart(fig_scatter_ndx, use_container_width=True)
+
+        st.markdown("#### 5) Latest correlation snapshot")
         latest_corr_rows = []
         for name, s in corr_map.items():
             val = latest_value(s)
