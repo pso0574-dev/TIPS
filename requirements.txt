@@ -4,3 +4,6 @@ numpy
 plotly
 yfinance
 requests
+python-dateutil
+
+
