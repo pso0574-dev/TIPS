@@ -3,7 +3,9 @@
 # Global Macro Monitoring Dashboard
 # - Oil / Rates / Gold / BTC / Equity / FX
 # - Period changes: 3M / 6M / 1Y / 5Y / 10Y
-# - Summary table + charts + simple signals
+# - Summary table + charts + signals
+# - Rates vs Equity tab
+# - Multi-Asset Trend now supports rates/spreads too
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -11,17 +13,16 @@
 # Install:
 #   pip install streamlit pandas numpy plotly yfinance requests python-dateutil
 #
-# Optional but recommended for FRED:
+# Optional:
 #   Set FRED_API_KEY in environment variables
-#   or in .streamlit/secrets.toml:
+#   or .streamlit/secrets.toml:
 #   FRED_API_KEY="YOUR_FRED_API_KEY"
 # ============================================================
 
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
 # ============================================================
-# Streamlit page config
+# Page setup
 # ============================================================
 st.set_page_config(
     page_title="Global Macro Monitoring Dashboard",
@@ -41,15 +42,14 @@ st.set_page_config(
 )
 
 st.title("🌍 Global Macro Monitoring Dashboard")
-st.caption(
-    "Oil / Rates / Gold / BTC / Equity / FX • Current level + 3M / 6M / 1Y / 5Y / 10Y changes"
-)
+st.caption("Oil / Rates / Gold / BTC / Equity / FX • Current level + 3M / 6M / 1Y / 5Y / 10Y changes")
 
 # ============================================================
 # Constants
 # ============================================================
 TODAY = pd.Timestamp.today().normalize()
-START_DATE = TODAY - relativedelta(years=11)  # enough for 10Y change calculation
+START_DATE = TODAY - relativedelta(years=11)
+
 DISPLAY_PERIODS = {
     "3M": relativedelta(months=3),
     "6M": relativedelta(months=6),
@@ -57,6 +57,7 @@ DISPLAY_PERIODS = {
     "5Y": relativedelta(years=5),
     "10Y": relativedelta(years=10),
 }
+
 GRAPH_PERIODS = {
     "3M": relativedelta(months=3),
     "6M": relativedelta(months=6),
@@ -66,9 +67,7 @@ GRAPH_PERIODS = {
     "ALL": relativedelta(years=11),
 }
 
-# Main assets requested by user
 ASSET_CONFIG = [
-    # Category, Asset, Symbol, Source, Unit, Type
     {"category": "Oil", "asset": "WTI Crude Oil", "symbol": "CL=F", "source": "Yahoo", "unit": "USD/bbl", "type": "price"},
     {"category": "Oil", "asset": "Brent Crude Oil", "symbol": "BZ=F", "source": "Yahoo", "unit": "USD/bbl", "type": "price"},
 
@@ -85,15 +84,13 @@ ASSET_CONFIG = [
     {"category": "Equity", "asset": "Dow Jones", "symbol": "^DJI", "source": "Yahoo", "unit": "Index", "type": "price"},
     {"category": "Equity", "asset": "Nasdaq 100", "symbol": "^NDX", "source": "Yahoo", "unit": "Index", "type": "price"},
 
-    {"category": "FX", "asset": "USD/KRW", "symbol": "KRW=X", "source": "Yahoo", "unit": "KRW per USD", "type": "fx_usdkrw"},
+    {"category": "FX", "asset": "USD/KRW", "symbol": "KRW=X", "source": "Yahoo", "unit": "KRW per USD", "type": "price"},
     {"category": "FX", "asset": "EUR/KRW", "symbol": "EURKRW=X", "source": "Yahoo", "unit": "KRW per EUR", "type": "price"},
 ]
 
-# FRED fallback proxies via Yahoo if no API key
+# Only limited fallback for 10Y if FRED is unavailable
 FRED_FALLBACK = {
-    "DGS10": "^TNX",   # 10Y yield proxy (Yahoo, *10)
-    "DGS2": "^IRX",    # not a perfect 2Y proxy; kept only as last resort
-    "DGS3MO": "^IRX",  # 13-week bill proxy
+    "DGS10": "^TNX",
 }
 
 # ============================================================
@@ -126,10 +123,6 @@ def format_current(value: Optional[float], unit: str, asset_type: str) -> str:
         return f"{value:.2f}%"
     if "KRW" in unit:
         return f"{value:,.1f}"
-    if unit in {"Index", "ETF"}:
-        return f"{value:,.2f}"
-    if unit in {"USD/bbl", "USD/oz", "EUR"}:
-        return f"{value:,.2f}"
     return f"{value:,.2f}"
 
 
@@ -143,31 +136,6 @@ def format_change(value: Optional[float], asset_type: str, as_bp: bool = False) 
     return f"{value:+.2f}%"
 
 
-def nearest_value(series: pd.Series, target_date: pd.Timestamp, tolerance_days: int = 7) -> Optional[float]:
-    if series.empty:
-        return None
-    s = series.dropna().sort_index()
-    if s.empty:
-        return None
-
-    # exact / nearest previous
-    idx = s.index.searchsorted(target_date, side="right") - 1
-    candidate = None
-    if idx >= 0:
-        candidate_date = s.index[idx]
-        if abs((target_date - candidate_date).days) <= tolerance_days:
-            candidate = safe_float(s.iloc[idx])
-
-    # if previous is too far, nearest absolute
-    if candidate is None:
-        diffs = np.abs((s.index - target_date).days)
-        min_i = int(np.argmin(diffs))
-        if diffs[min_i] <= tolerance_days:
-            candidate = safe_float(s.iloc[min_i])
-
-    return candidate
-
-
 def latest_value(series: pd.Series) -> Optional[float]:
     if series is None or series.empty:
         return None
@@ -175,6 +143,29 @@ def latest_value(series: pd.Series) -> Optional[float]:
     if s.empty:
         return None
     return safe_float(s.iloc[-1])
+
+
+def nearest_value(series: pd.Series, target_date: pd.Timestamp, tolerance_days: int = 10) -> Optional[float]:
+    if series.empty:
+        return None
+    s = series.dropna().sort_index()
+    if s.empty:
+        return None
+
+    idx = s.index.searchsorted(target_date, side="right") - 1
+    candidate = None
+    if idx >= 0:
+        candidate_date = s.index[idx]
+        if abs((target_date - candidate_date).days) <= tolerance_days:
+            candidate = safe_float(s.iloc[idx])
+
+    if candidate is None:
+        diffs = np.abs((s.index - target_date).days)
+        min_i = int(np.argmin(diffs))
+        if diffs[min_i] <= tolerance_days:
+            candidate = safe_float(s.iloc[min_i])
+
+    return candidate
 
 
 def compute_pct_change(current: Optional[float], past: Optional[float]) -> Optional[float]:
@@ -194,25 +185,56 @@ def normalize_to_100(series: pd.Series) -> pd.Series:
     if s.empty:
         return s
     base = s.iloc[0]
-    if base == 0 or pd.isna(base):
-        return s * np.nan
+    if pd.isna(base) or base == 0:
+        return pd.Series(index=s.index, dtype=float)
     return s / base * 100.0
 
 
+def compute_return(series: pd.Series) -> pd.Series:
+    s = series.dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    return s.pct_change()
+
+
+def compute_diff(series: pd.Series) -> pd.Series:
+    s = series.dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    return s.diff()
+
+
+def rolling_corr(series_a: pd.Series, series_b: pd.Series, window: int = 30) -> pd.Series:
+    df = pd.concat([series_a.rename("a"), series_b.rename("b")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float)
+    return df["a"].rolling(window).corr(df["b"])
+
+
+def filter_series_by_period(series: pd.Series, period_label: str) -> pd.Series:
+    if series.empty:
+        return series
+    start = TODAY - GRAPH_PERIODS[period_label]
+    return series.loc[series.index >= start].dropna()
+
+
+# ============================================================
+# Signals
+# ============================================================
 def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: Optional[float]) -> str:
     asset = row["Asset"]
     category = row["Category"]
-    ch_3m = row["3M_raw"]
-    ch_1y = row["1Y_raw"]
+    ch_3m = row.get("3M_raw")
+    ch_1y = row.get("1Y_raw")
+    curr = row.get("Current_raw")
 
     if category == "Rate":
-        curr = row["Current_raw"]
         if curr is None:
             return "N/A"
         if asset == "US 10Y Yield":
             if curr >= 4.5:
                 return "Tight"
-            if curr <= 3.0:
+            elif curr <= 3.0:
                 return "Loose"
             return "Neutral"
         if asset == "US 2Y Yield":
@@ -223,7 +245,7 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "WTI Crude Oil":
         if ch_3m is not None and ch_3m >= 10:
             return "Inflation Watch"
-        if ch_3m is not None and ch_3m <= -10:
+        elif ch_3m is not None and ch_3m <= -10:
             return "Demand Weakness"
         return "Neutral"
 
@@ -235,14 +257,14 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "Bitcoin / EUR":
         if ch_3m is not None and ch_3m > 15:
             return "Risk-On"
-        if ch_3m is not None and ch_3m < -15:
+        elif ch_3m is not None and ch_3m < -15:
             return "Risk-Off"
         return "Volatile"
 
     if asset == "S&P 500":
         if ch_1y is not None and ch_1y > 10:
             return "Growth"
-        if ch_1y is not None and ch_1y < -10:
+        elif ch_1y is not None and ch_1y < -10:
             return "Weakness"
         return "Neutral"
 
@@ -254,28 +276,28 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
     if asset == "USD/KRW":
         if ch_3m is not None and ch_3m > 3:
             return "KRW Weakness"
-        if ch_3m is not None and ch_3m < -3:
+        elif ch_3m is not None and ch_3m < -3:
             return "KRW Strength"
         return "Neutral"
 
     if asset == "EUR/KRW":
         if ch_3m is not None and ch_3m > 3:
             return "EUR Strong"
-        if ch_3m is not None and ch_3m < -3:
+        elif ch_3m is not None and ch_3m < -3:
             return "EUR Weak"
         return "Neutral"
 
     if asset == "US 10Y-2Y Spread" and spread_10y_2y is not None:
         if spread_10y_2y < 0:
             return "Inverted"
-        if spread_10y_2y < 0.5:
+        elif spread_10y_2y < 0.5:
             return "Flat"
         return "Steep"
 
     if asset == "US 10Y-3M Spread" and spread_10y_3m is not None:
         if spread_10y_3m < 0:
             return "Inverted"
-        if spread_10y_3m < 0.5:
+        elif spread_10y_3m < 0.5:
             return "Flat"
         return "Steep"
 
@@ -283,13 +305,10 @@ def build_signal(row: pd.Series, spread_10y_2y: Optional[float], spread_10y_3m: 
 
 
 # ============================================================
-# Data loading
+# Data loaders
 # ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def load_yahoo_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    """
-    Robust Yahoo loader using start/end instead of custom period strings.
-    """
     try:
         df = yf.download(
             symbol,
@@ -303,7 +322,6 @@ def load_yahoo_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> p
         if df is None or df.empty:
             return pd.Series(dtype=float)
 
-        # Sometimes columns come as MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             if ("Adj Close", symbol) in df.columns:
                 s = df[("Adj Close", symbol)]
@@ -328,9 +346,6 @@ def load_yahoo_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> p
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_fred_series(series_id: str, start: pd.Timestamp, end: pd.Timestamp, api_key: Optional[str]) -> pd.Series:
-    """
-    FRED daily/available observations loader.
-    """
     if not api_key:
         return pd.Series(dtype=float)
 
@@ -372,44 +387,39 @@ def load_all_series() -> Dict[str, pd.Series]:
     for item in ASSET_CONFIG:
         sym = item["symbol"]
         src = item["source"]
-        a_type = item["type"]
 
         if src == "Yahoo":
             s = load_yahoo_history(sym, START_DATE, TODAY)
+
         elif src == "FRED":
             s = load_fred_series(sym, START_DATE, TODAY, api_key)
 
-            # optional fallback for missing FRED key / failure
-            if s.empty:
-                fb = FRED_FALLBACK.get(sym)
-                if fb:
-                    s_fb = load_yahoo_history(fb, START_DATE, TODAY)
-                    if not s_fb.empty:
-                        # Yahoo treasury proxies like ^TNX are often in yield*10
-                        if fb == "^TNX":
-                            s_fb = s_fb / 10.0
-                        elif fb == "^IRX":
-                            s_fb = s_fb / 10.0
-                        s = s_fb
+            # limited fallback only for DGS10
+            if s.empty and sym in FRED_FALLBACK:
+                fb = FRED_FALLBACK[sym]
+                s_fb = load_yahoo_history(fb, START_DATE, TODAY)
+                if not s_fb.empty and fb == "^TNX":
+                    s = s_fb / 10.0
+
         else:
             s = pd.Series(dtype=float)
 
         out[sym] = s
 
-    # Derived spread series
     d10 = out.get("DGS10", pd.Series(dtype=float))
     d2 = out.get("DGS2", pd.Series(dtype=float))
     d3m = out.get("DGS3MO", pd.Series(dtype=float))
 
+    # Only compute spreads if both true series exist
     if not d10.empty and not d2.empty:
-        aligned = pd.concat([d10.rename("10Y"), d2.rename("2Y")], axis=1).dropna()
-        out["SPREAD_10Y_2Y"] = aligned["10Y"] - aligned["2Y"]
+        aligned_10_2 = pd.concat([d10.rename("10Y"), d2.rename("2Y")], axis=1).dropna()
+        out["SPREAD_10Y_2Y"] = aligned_10_2["10Y"] - aligned_10_2["2Y"]
     else:
         out["SPREAD_10Y_2Y"] = pd.Series(dtype=float)
 
     if not d10.empty and not d3m.empty:
-        aligned = pd.concat([d10.rename("10Y"), d3m.rename("3M")], axis=1).dropna()
-        out["SPREAD_10Y_3M"] = aligned["10Y"] - aligned["3M"]
+        aligned_10_3m = pd.concat([d10.rename("10Y"), d3m.rename("3M")], axis=1).dropna()
+        out["SPREAD_10Y_3M"] = aligned_10_3m["10Y"] - aligned_10_3m["3M"]
     else:
         out["SPREAD_10Y_3M"] = pd.Series(dtype=float)
 
@@ -417,7 +427,7 @@ def load_all_series() -> Dict[str, pd.Series]:
 
 
 # ============================================================
-# Summary table builder
+# Summary table
 # ============================================================
 def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
     rows = []
@@ -446,6 +456,7 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
         for label, delta in DISPLAY_PERIODS.items():
             past_date = TODAY - delta
             past = nearest_value(s, past_date)
+
             if asset_type == "rate":
                 raw_change = compute_pp_change(current, past)
                 row[f"{label}_raw"] = raw_change
@@ -458,13 +469,14 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
         row["Current"] = format_current(current, unit, asset_type)
         rows.append(row)
 
-    # Add spread rows
+    # Derived spreads
     for spread_symbol, spread_name in [
         ("SPREAD_10Y_2Y", "US 10Y-2Y Spread"),
         ("SPREAD_10Y_3M", "US 10Y-3M Spread"),
     ]:
         s = series_map.get(spread_symbol, pd.Series(dtype=float))
         current = latest_value(s)
+
         row = {
             "Category": "Rate",
             "Asset": spread_name,
@@ -474,12 +486,14 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
             "Source": "Derived",
             "Type": "rate",
         }
+
         for label, delta in DISPLAY_PERIODS.items():
             past_date = TODAY - delta
             past = nearest_value(s, past_date)
             raw_change = compute_pp_change(current, past)
             row[f"{label}_raw"] = raw_change
             row[label] = format_change(raw_change, "rate")
+
         row["Current"] = "N/A" if current is None else f"{current:+.2f}pp"
         rows.append(row)
 
@@ -500,7 +514,6 @@ def build_summary_table(series_map: Dict[str, pd.Series]) -> pd.DataFrame:
         lambda r: build_signal(r, spread_10y_2y=spread_10y_2y, spread_10y_3m=spread_10y_3m),
         axis=1,
     )
-
     return df
 
 
@@ -511,11 +524,11 @@ def color_change_cell(val: str) -> str:
     try:
         if val == "N/A":
             return "color: #999999;"
-        s = str(val).replace("%", "").replace("pp", "").replace("bp", "").replace("+", "")
+        s = str(val).replace("%", "").replace("pp", "").replace("bp", "")
         num = float(s)
         if num > 0:
             return "color: #0a7f2e; font-weight: 600;"
-        if num < 0:
+        elif num < 0:
             return "color: #b00020; font-weight: 600;"
         return "color: #666666;"
     except Exception:
@@ -541,14 +554,6 @@ def color_signal_cell(val: str) -> str:
 # ============================================================
 # Charts
 # ============================================================
-def filter_series_by_period(series: pd.Series, period_label: str) -> pd.Series:
-    if series.empty:
-        return series
-    delta = GRAPH_PERIODS[period_label]
-    start = TODAY - delta
-    return series.loc[series.index >= start].dropna()
-
-
 def make_line_chart(
     series_dict: Dict[str, pd.Series],
     title: str,
@@ -562,14 +567,8 @@ def make_line_chart(
             continue
         if normalize:
             s = normalize_to_100(s)
-        fig.add_trace(
-            go.Scatter(
-                x=s.index,
-                y=s.values,
-                mode="lines",
-                name=name,
-            )
-        )
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name))
+
     fig.update_layout(
         title=title,
         height=520,
@@ -582,21 +581,50 @@ def make_line_chart(
     return fig
 
 
+def make_dual_axis_chart(
+    left_series: Dict[str, pd.Series],
+    right_series: Dict[str, pd.Series],
+    title: str,
+    left_title: str,
+    right_title: str,
+) -> go.Figure:
+    fig = go.Figure()
+
+    for name, s in left_series.items():
+        s = s.dropna()
+        if s.empty:
+            continue
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name, yaxis="y"))
+
+    for name, s in right_series.items():
+        s = s.dropna()
+        if s.empty:
+            continue
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name, yaxis="y2"))
+
+    fig.update_layout(
+        title=title,
+        height=520,
+        hovermode="x unified",
+        margin=dict(l=40, r=40, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(title="Date"),
+        yaxis=dict(title=left_title),
+        yaxis2=dict(title=right_title, overlaying="y", side="right"),
+    )
+    return fig
+
+
 def make_bar_chart(summary_df: pd.DataFrame, period_col: str, asset_filter: str) -> go.Figure:
     df = summary_df.copy()
     if asset_filter != "All":
         df = df[df["Category"] == asset_filter]
 
-    vals = df[f"{period_col}_raw"].copy()
-    chart_df = pd.DataFrame(
-        {
-            "Asset": df["Asset"],
-            "Value": vals,
-            "Type": df["Type"],
-        }
-    ).dropna()
+    chart_df = pd.DataFrame({
+        "Asset": df["Asset"],
+        "Value": df[f"{period_col}_raw"],
+    }).dropna()
 
-    # Keep rates and prices together but readable
     fig = go.Figure()
     if not chart_df.empty:
         fig.add_trace(
@@ -620,7 +648,7 @@ def make_bar_chart(summary_df: pd.DataFrame, period_col: str, asset_filter: str)
 
 
 # ============================================================
-# Sidebar / Controls
+# Sidebar
 # ============================================================
 with st.sidebar:
     st.header("Controls")
@@ -629,7 +657,7 @@ with st.sidebar:
     selected_graph_period = st.selectbox(
         "Graph Period",
         options=list(GRAPH_PERIODS.keys()),
-        index=2,  # 1Y
+        index=2,
     )
 
     category_options = ["All", "Oil", "Rate", "Metal", "Commodity", "Crypto", "Equity", "FX"]
@@ -638,23 +666,21 @@ with st.sidebar:
     sort_options = [
         "Category",
         "Asset",
+        "Current_raw",
         "3M_raw",
         "6M_raw",
         "1Y_raw",
         "5Y_raw",
         "10Y_raw",
-        "Current_raw",
     ]
     selected_sort = st.selectbox("Sort By", sort_options, index=3)
-
     sort_desc = st.checkbox("Descending", value=True)
 
     show_all_columns = st.checkbox("Show raw helper columns", value=False)
-    normalize_chart = st.checkbox("Normalize multi-asset chart to 100", value=True)
+    normalize_chart = st.checkbox("Normalize Multi-Asset chart to 100", value=True)
 
     st.markdown("---")
-    st.markdown("**Data notes**")
-    st.caption("Rates use FRED when API key is available. Yahoo proxies may be used as fallback for missing FRED data.")
+    st.caption("Rates use FRED when available. Only 10Y has a limited Yahoo fallback.")
 
 if refresh:
     st.cache_data.clear()
@@ -666,8 +692,17 @@ with st.spinner("Loading market data..."):
     series_map = load_all_series()
     summary_df = build_summary_table(series_map)
 
+fred_ok = (
+    not series_map.get("DGS10", pd.Series(dtype=float)).empty
+    and not series_map.get("DGS2", pd.Series(dtype=float)).empty
+    and not series_map.get("DGS3MO", pd.Series(dtype=float)).empty
+)
+
+if not fred_ok:
+    st.warning("FRED rate data is incomplete. 2Y / 3M / spread series may be unavailable until FRED_API_KEY is set.")
+
 # ============================================================
-# Filter / sort summary table
+# Summary table view
 # ============================================================
 view_df = summary_df.copy()
 
@@ -675,10 +710,7 @@ if selected_category != "All":
     view_df = view_df[view_df["Category"] == selected_category].copy()
 
 if selected_sort in view_df.columns:
-    if selected_sort.endswith("_raw") or selected_sort == "Current_raw":
-        view_df = view_df.sort_values(selected_sort, ascending=not sort_desc, na_position="last")
-    else:
-        view_df = view_df.sort_values(selected_sort, ascending=not sort_desc, na_position="last")
+    view_df = view_df.sort_values(selected_sort, ascending=not sort_desc, na_position="last")
 
 display_cols = [
     "Category",
@@ -708,14 +740,10 @@ styled = (
     .map(color_signal_cell, subset=["Signal"])
 )
 
-st.dataframe(
-    styled,
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(styled, use_container_width=True, hide_index=True)
 
 # ============================================================
-# KPI cards
+# Quick snapshot
 # ============================================================
 st.subheader("Quick Risk Snapshot")
 
@@ -735,7 +763,6 @@ inflation_score = "High" if oil_3m is not None and oil_3m > 10 else "Moderate" i
 risk_sentiment = "Risk-On" if (btc_3m is not None and btc_3m > 10 and spx_1y is not None and spx_1y > 10) else "Mixed"
 if gold_1y is not None and gold_1y > 10 and (spx_1y is not None and spx_1y < 5):
     risk_sentiment = "Risk-Off"
-
 yield_curve = "Inverted" if spread_10y_2y is not None and spread_10y_2y < 0 else "Normal"
 growth = "Strong" if spx_1y is not None and spx_1y > 10 else "Weak" if spx_1y is not None and spx_1y < 0 else "Moderate"
 
@@ -748,8 +775,8 @@ c4.metric("Growth Momentum", growth)
 # ============================================================
 # Tabs
 # ============================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Multi-Asset Trend", "Rates", "Equity", "FX", "Change Bar"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Multi-Asset Trend", "Rates", "Equity", "FX", "Change Bar", "Rates vs Equity"]
 )
 
 with tab1:
@@ -758,6 +785,11 @@ with tab1:
     asset_name_to_symbol = {
         "WTI Crude Oil": "CL=F",
         "Brent Crude Oil": "BZ=F",
+        "US 10Y Yield": "DGS10",
+        "US 2Y Yield": "DGS2",
+        "US 3M Yield": "DGS3MO",
+        "US 10Y-2Y Spread": "SPREAD_10Y_2Y",
+        "US 10Y-3M Spread": "SPREAD_10Y_3M",
         "Gold": "GC=F",
         "Broad Commodities ETF": "DBC",
         "Bitcoin / EUR": "BTC-EUR",
@@ -768,12 +800,18 @@ with tab1:
         "EUR/KRW": "EURKRW=X",
     }
 
-    default_assets = ["WTI Crude Oil", "Gold", "Bitcoin / EUR", "S&P 500", "Nasdaq 100", "USD/KRW"]
+    default_assets = ["WTI Crude Oil", "US 10Y Yield", "Gold", "Bitcoin / EUR", "S&P 500", "USD/KRW"]
 
     selected_assets = st.multiselect(
         "Select assets",
         options=list(asset_name_to_symbol.keys()),
         default=default_assets,
+    )
+
+    multi_chart_mode = st.radio(
+        "Chart Mode",
+        ["Single Axis", "Dual Axis (Rates left / Others right)"],
+        horizontal=True,
     )
 
     chart_map = {}
@@ -783,13 +821,40 @@ with tab1:
         if not s.empty:
             chart_map[name] = s
 
-    fig = make_line_chart(
-        chart_map,
-        title=f"Multi-Asset Trend ({selected_graph_period})",
-        normalize=normalize_chart,
-        yaxis_title="Indexed to 100" if normalize_chart else "Price / Level",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    rate_assets = {
+        "US 10Y Yield",
+        "US 2Y Yield",
+        "US 3M Yield",
+        "US 10Y-2Y Spread",
+        "US 10Y-3M Spread",
+    }
+
+    if multi_chart_mode == "Single Axis":
+        fig = make_line_chart(
+            chart_map,
+            title=f"Multi-Asset Trend ({selected_graph_period})",
+            normalize=normalize_chart,
+            yaxis_title="Indexed to 100" if normalize_chart else "Price / Level",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        left_map = {}
+        right_map = {}
+
+        for name, s in chart_map.items():
+            if name in rate_assets:
+                left_map[name] = normalize_to_100(s) if normalize_chart else s
+            else:
+                right_map[name] = normalize_to_100(s) if normalize_chart else s
+
+        fig = make_dual_axis_chart(
+            left_series=left_map,
+            right_series=right_map,
+            title=f"Multi-Asset Trend ({selected_graph_period})",
+            left_title="Rates / Spreads" if not normalize_chart else "Indexed to 100",
+            right_title="Assets" if not normalize_chart else "Indexed to 100",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
     st.markdown("### Rates & Yield Curve")
@@ -846,8 +911,93 @@ with tab5:
     fig_bar = make_bar_chart(summary_df, selected_bar_period, selected_category)
     st.plotly_chart(fig_bar, use_container_width=True)
 
+with tab6:
+    st.markdown("### Rates vs Equity")
+
+    d10 = filter_series_by_period(series_map.get("DGS10", pd.Series(dtype=float)), selected_graph_period)
+    d2 = filter_series_by_period(series_map.get("DGS2", pd.Series(dtype=float)), selected_graph_period)
+    spx = filter_series_by_period(series_map.get("^GSPC", pd.Series(dtype=float)), selected_graph_period)
+    ndx = filter_series_by_period(series_map.get("^NDX", pd.Series(dtype=float)), selected_graph_period)
+
+    if d10.empty or spx.empty:
+        st.warning("Not enough data to compare rates and equity.")
+    else:
+        st.markdown("#### 1) Level comparison")
+        fig_lvl = make_dual_axis_chart(
+            left_series={
+                "US 10Y Yield": d10,
+                "US 2Y Yield": d2,
+            },
+            right_series={
+                "S&P 500": spx,
+                "Nasdaq 100": ndx,
+            },
+            title=f"Rates vs Equity Levels ({selected_graph_period})",
+            left_title="Yield (%)",
+            right_title="Equity Index",
+        )
+        st.plotly_chart(fig_lvl, use_container_width=True)
+
+        st.markdown("#### 2) Normalized comparison")
+        norm_map = {}
+        if not d10.empty:
+            norm_map["US 10Y Yield"] = normalize_to_100(d10)
+        if not d2.empty:
+            norm_map["US 2Y Yield"] = normalize_to_100(d2)
+        if not spx.empty:
+            norm_map["S&P 500"] = normalize_to_100(spx)
+        if not ndx.empty:
+            norm_map["Nasdaq 100"] = normalize_to_100(ndx)
+
+        fig_norm = make_line_chart(
+            norm_map,
+            title=f"Rates vs Equity Normalized ({selected_graph_period})",
+            normalize=False,
+            yaxis_title="Indexed to 100",
+        )
+        st.plotly_chart(fig_norm, use_container_width=True)
+
+        st.markdown("#### 3) Rolling correlation")
+        corr_window = st.selectbox(
+            "Rolling correlation window",
+            options=[20, 30, 60, 90],
+            index=1,
+        )
+
+        d10_chg = compute_diff(d10)
+        d2_chg = compute_diff(d2)
+        spx_ret = compute_return(spx)
+        ndx_ret = compute_return(ndx)
+
+        corr_map = {
+            f"10Y Δ vs S&P500 return ({corr_window}d)": rolling_corr(d10_chg, spx_ret, corr_window),
+            f"10Y Δ vs Nasdaq100 return ({corr_window}d)": rolling_corr(d10_chg, ndx_ret, corr_window),
+        }
+
+        if not d2.empty:
+            corr_map[f"2Y Δ vs S&P500 return ({corr_window}d)"] = rolling_corr(d2_chg, spx_ret, corr_window)
+            corr_map[f"2Y Δ vs Nasdaq100 return ({corr_window}d)"] = rolling_corr(d2_chg, ndx_ret, corr_window)
+
+        fig_corr = make_line_chart(
+            corr_map,
+            title=f"Rolling Correlation: Rate Changes vs Equity Returns ({selected_graph_period})",
+            normalize=False,
+            yaxis_title="Correlation",
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+        st.markdown("#### 4) Latest correlation snapshot")
+        latest_corr_rows = []
+        for name, s in corr_map.items():
+            val = latest_value(s)
+            latest_corr_rows.append({
+                "Pair": name,
+                "Latest Corr": None if val is None else round(val, 3)
+            })
+        st.dataframe(pd.DataFrame(latest_corr_rows), use_container_width=True, hide_index=True)
+
 # ============================================================
-# Raw data preview
+# Raw preview
 # ============================================================
 with st.expander("See raw latest series data"):
     preview_options = st.multiselect(
@@ -864,6 +1014,4 @@ with st.expander("See raw latest series data"):
             st.dataframe(s.tail(10).rename(sym).to_frame(), use_container_width=True)
 
 st.markdown("---")
-st.caption(
-    "Tip: For FRED rates, set FRED_API_KEY in environment variables or .streamlit/secrets.toml."
-)
+st.caption("Tip: set FRED_API_KEY for full rate/spread support.")
